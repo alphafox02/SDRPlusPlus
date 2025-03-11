@@ -10,6 +10,7 @@
 #include <utils/optionlist.h>
 #include <algorithm>
 #include <regex>
+#include <set> // Added for duplicate filtering
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
@@ -123,6 +124,9 @@ private:
         std::regex modelRgx("\\(.+(?=\\),)", std::regex::ECMAScript);
         std::regex serialRgx("serial=[0-9A-Za-z]+", std::regex::ECMAScript);
 
+        // For duplicate filtering on IP-based entries only
+        std::set<std::string> ipSeenSerials;
+
         // Enumerate devices
         iio_context_info** ctxInfoList;
         ssize_t count = iio_scan_context_get_info_list(sctx, &ctxInfoList);
@@ -172,6 +176,16 @@ private:
             if (std::regex_search(desc, serialMatch, serialRgx)) {
                 serial = serialMatch[0].str().substr(7);
             }
+
+            // *** Change: If this is an IP-based entry, check for duplicates by serial.
+            if (duri.find("ip:") == 0) {
+                if (ipSeenSerials.count(serial)) {
+                    flog::warn("Skipping duplicate IP PlutoSDR entry with serial: {}", serial);
+                    continue;
+                }
+                ipSeenSerials.insert(serial);
+            }
+            // *** End change
 
             // Construct the device name
             std::string devName = '(' + backend + ") " + model + " [" + serial + ']';
