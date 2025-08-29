@@ -8,7 +8,6 @@
 #include <gui/smgui.h>
 #include <lime/LimeSuite.h>
 
-
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
 
 SDRPP_MOD_INFO{
@@ -26,8 +25,6 @@ public:
     LimeSDRSourceModule(std::string name) {
         this->name = name;
 
-        // Init limesuite if needed
-
         sampleRate = 10000000.0;
 
         handler.ctx = this;
@@ -40,10 +37,7 @@ public:
         handler.stream = &stream;
 
         refresh();
-
-        // Select device from config
         selectFirst();
-
         sigpath::sourceManager.registerSource("LimeSDR", &handler);
     }
 
@@ -54,17 +48,9 @@ public:
 
     void postInit() {}
 
-    void enable() {
-        enabled = true;
-    }
-
-    void disable() {
-        enabled = false;
-    }
-
-    bool isEnabled() {
-        return enabled;
-    }
+    void enable() { enabled = true; }
+    void disable() { enabled = false; }
+    bool isEnabled() { return enabled; }
 
     void refresh() {
         devCount = LMS_GetDeviceList(devList);
@@ -144,16 +130,15 @@ public:
 
         chanId = std::clamp<int>(chanId, 0, channelCount - 1);
 
-        // List antennas
-        lms_name_t antennaNames[16];
-        antennaCount = LMS_GetAntennaList(dev, false, chanId, antennaNames);
-        antennaNameList.clear();
-        antennaListTxt = "";
-        for (int i = 0; i < antennaCount; i++) {
-            antennaNameList.push_back(antennaNames[i]);
-            antennaListTxt += antennaNames[i];
+        // --- HARDCODED ANTENNA NAMES ---
+        antennaNameList = {"NONE", "LNAH", "LNAL_NC", "LNAW", "Auto"};
+        antennaListTxt.clear();
+        for (const auto& name : antennaNameList) {
+            antennaListTxt += name;
             antennaListTxt += '\0';
         }
+        antennaCount = antennaNameList.size();
+        // --- END HARDCODED ---
 
         // List supported sample rates
         lms_range_t srRange;
@@ -228,7 +213,7 @@ public:
             std::string antName = config.conf["devices"][selectedDevName]["antenna"];
             bool found = false;
             for (int i = 0; i < antennaCount; i++) {
-                if (antennaNames[i] == antName) {
+                if (antennaNameList[i] == antName) {
                     antennaId = i;
                     found = true;
                     break;
@@ -236,7 +221,7 @@ public:
             }
             if (!found) {
                 for (int i = 0; i < antennaCount; i++) {
-                    if (antennaNames[i] == "LNAW") {
+                    if (antennaNameList[i] == "LNAW") {
                         antennaId = i;
                         found = true;
                         break;
@@ -248,7 +233,7 @@ public:
         else {
             bool found = false;
             for (int i = 0; i < antennaCount; i++) {
-                if (antennaNames[i] == "LNAW") {
+                if (antennaNameList[i] == "LNAW") {
                     antennaId = i;
                     found = true;
                     break;
@@ -351,7 +336,7 @@ private:
         int sampCount = _this->sampleRate / 200;
         _this->devStream.isTx = false;
         _this->devStream.channel = _this->chanId;
-        _this->devStream.fifoSize = sampCount; // TODO: Check what it's actually supposed to be
+        _this->devStream.fifoSize = sampCount;
         _this->devStream.throughputVsLatency = 0.5f;
         _this->devStream.dataFmt = _this->devStream.LMS_FMT_F32;
         LMS_SetupStream(_this->openDev, &_this->devStream);
@@ -360,7 +345,6 @@ private:
         _this->streamRunning = true;
         LMS_StartStream(&_this->devStream);
         _this->workerThread = std::thread(&LimeSDRSourceModule::worker, _this);
-
 
         _this->running = true;
         flog::info("LimeSDRSourceModule '{0}': Start!", _this->name);
