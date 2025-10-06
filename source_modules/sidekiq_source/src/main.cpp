@@ -123,62 +123,66 @@ public:
             }
             libInited.store(true);
         }
-
+    
         uint8_t cards[SKIQ_MAX_NUM_CARDS] = {0};
         uint8_t num = 0;
-
-        // Only try AUTO if PCIe query itself fails (not when it succeeds with num=0)
-        int32_t st = skiq_get_cards(skiq_xport_type_pcie, &num, cards);
-        if (st != 0) {
-            st = skiq_get_cards(skiq_xport_type_auto, &num, cards);
-            if (st != 0) {
-                flog::error("Sidekiq: skiq_get_cards failed ({})", (int)st);
-                devices.clear();
-                return;
-            }
-        }
-
+    
+        auto try_get = [&](skiq_xport_type_t x) -> int32_t {
+            std::memset(cards, 0, sizeof(cards));
+            num = 0;
+            int32_t rc = skiq_get_cards(x, &num, cards);
+            flog::info("Sidekiq: get_cards(xport={}, rc={}, num={})", (int)x, (int)rc, (int)num);
+            return rc;
+        };
+    
+        // Prefer PCIe; if it errors OR finds zero, try AUTO.
+        int32_t st = try_get(skiq_xport_type_pcie);
+        if (st != 0 || num == 0) st = try_get(skiq_xport_type_auto);
+    
         devices.clear();
-
-        if (num == 0) {
-            // Nothing attached—leave list empty and return without touching hardware.
+    
+        if (st != 0 || num == 0) {
+            flog::warn("Sidekiq: no cards detected on PCIe/Auto (st={}, num={})", (int)st, (int)num);
             deviceIdx     = 0;
             handleIdx     = 0;
             rfPortIdx     = 0;
             streamModeIdx = std::min(streamModeIdx, std::max(0, modes.size()-1));
             return;
         }
-
-        // Try BASIC enable to read serials. If it fails, do not proceed further.
+    
+        // Try BASIC to read serials, but ALWAYS list devices even if BASIC fails/EBUSY.
         bool basicEnabled = false;
-        int32_t st_en = skiq_enable_cards(cards, num, skiq_xport_init_level_basic);
-        if (st_en == 0) {
-            basicEnabled = true;
-        } else {
-            flog::warn("Sidekiq: enable_cards(BASIC) failed ({}); skipping serial read", (int)st_en);
-        }
-
-        std::unordered_set<std::string> seenKeys;
-        if (basicEnabled) {
-            for (uint8_t i = 0; i < num; ++i) {
-                char* serial = nullptr;
-                std::string key;
-                if (skiq_read_serial_string(cards[i], &serial) == 0 && serial) {
-                    key = serial;
-                } else {
-                    char tmp[32]; snprintf(tmp, sizeof(tmp), "card-%u", cards[i]);
-                    key = tmp;
-                }
-                if (seenKeys.insert(key).second) {
-                    devices.define(key, key, cards[i]);
-                }
+        {
+            int32_t st_en = skiq_enable_cards(cards, num, skiq_xport_init_level_basic);
+            if (st_en == 0) {
+                basicEnabled = true;
+            } else {
+                flog::warn("Sidekiq: enable_cards(BASIC) failed ({}); proceeding without serials", (int)st_en);
             }
         }
-
+    
+        std::unordered_set<std::string> seenKeys;
+        for (uint8_t i = 0; i < num; ++i) {
+            std::string key;
+            if (basicEnabled) {
+                char* serial = nullptr;
+                if (skiq_read_serial_string(cards[i], &serial) == 0 && serial && serial[0]) {
+                    key = serial;
+                }
+            }
+            if (key.empty()) {
+                char tmp[32]; std::snprintf(tmp, sizeof(tmp), "card-%u", cards[i]);
+                key = tmp;
+            }
+            if (seenKeys.insert(key).second) {
+                devices.define(key, key, cards[i]);
+            }
+        }
+    
         if (basicEnabled) {
             (void)skiq_disable_cards(cards, num);
         }
-
+    
         deviceIdx     = std::min(deviceIdx,     std::max(0, devices.size()-1));
         handleIdx     = std::min(handleIdx,     std::max(0, handles.size()-1));
         rfPortIdx     = std::min(rfPortIdx,     std::max(0, rfPorts.size()-1));
