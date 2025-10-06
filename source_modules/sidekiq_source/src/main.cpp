@@ -135,15 +135,14 @@ public:
             return rc;
         };
     
-        // Prefer PCIe; if it errors OR finds zero, try embedded; then auto.
+        // Prefer PCIe; if it errors OR finds zero, try AUTO.
         int32_t st = try_get(skiq_xport_type_pcie);
-        if (st != 0 || num == 0) st = try_get(skiq_xport_type_embedded);
         if (st != 0 || num == 0) st = try_get(skiq_xport_type_auto);
     
         devices.clear();
     
         if (st != 0 || num == 0) {
-            flog::warn("Sidekiq: no cards detected on any transport (st={}, num={})", (int)st, (int)num);
+            flog::warn("Sidekiq: no cards detected on PCIe/Auto (st={}, num={})", (int)st, (int)num);
             deviceIdx     = 0;
             handleIdx     = 0;
             rfPortIdx     = 0;
@@ -151,7 +150,7 @@ public:
             return;
         }
     
-        // Try BASIC enable to read serials, but ALWAYS list devices even if it fails/EBUSY.
+        // Try BASIC to read serials, but ALWAYS list devices even if BASIC fails/EBUSY.
         bool basicEnabled = false;
         {
             int32_t st_en = skiq_enable_cards(cards, num, skiq_xport_init_level_basic);
