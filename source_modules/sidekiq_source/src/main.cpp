@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <fstream>
+#include <map>
 
 #define CONCAT_STR(a, b) ((std::string(a) + b).c_str())
 
@@ -30,7 +31,7 @@ SDRPP_MOD_INFO{
     /* Name:            */ "sidekiq_source",
     /* Description:     */ "Epiq Sidekiq source module for SDR++",
     /* Author:          */ "Aaron",
-    /* Version:         */ 0, 1, 6,
+    /* Version:         */ 0, 1, 7,
     /* Max instances    */ 1
 };
 
@@ -61,10 +62,11 @@ public:
         gainMin    = 0;
         gainMax    = 76;
 
-        // Profiles (optional)
-        useProfiles  = false;
-        profilesPath = "";
-        profileIdx   = 0;
+        // Profiles / presets
+        useProfiles        = false;      // UI toggle
+        nvProfilesEnabled  = false;      // becomes true for NV100/NVM2
+        nvSelectedRateHz   = 10'000'000; // default SR when NV presets are active
+        nvBwPercent        = 50;         // default BW% when NV presets are active
 
         // Stream modes in UI
         modes.define("High Throughput", "High Throughput", skiq_rx_stream_mode_high_tput);
@@ -90,10 +92,11 @@ public:
         if (g_config.conf.contains("bandwidth"))  bandwidth  = (int)g_config.conf["bandwidth"];
         if (g_config.conf.contains("gainMode"))   gainMode   = (skiq_rx_gain_t)((int)g_config.conf["gainMode"]);
         if (g_config.conf.contains("gainIndex"))  gainIndex  = (int)g_config.conf["gainIndex"];
-        if (g_config.conf.contains("useProfiles"))  useProfiles  = (bool)g_config.conf["useProfiles"];
-        if (g_config.conf.contains("profilesPath")) profilesPath = (std::string)g_config.conf["profilesPath"];
-        if (g_config.conf.contains("profileIdx"))   profileIdx   = (int)g_config.conf["profileIdx"];
-        if (useProfiles && !profilesPath.empty()) loadProfilesFromJson(profilesPath.c_str());
+        if (g_config.conf.contains("useProfiles"))      useProfiles       = (bool)g_config.conf["useProfiles"];
+        if (g_config.conf.contains("nvSelectedRateHz")) nvSelectedRateHz  = (int)g_config.conf["nvSelectedRateHz"];
+        if (g_config.conf.contains("nvBwPercent"))      nvBwPercent       = (int)g_config.conf["nvBwPercent"];
+        // Persisted RF port (keyed by device key string)
+        if (g_config.conf.contains("rfPortByDevice"))   rfPortByDevice = g_config.conf["rfPortByDevice"];
         g_config.release();
 
         core::setInputSampleRate(sampleRate);
@@ -123,10 +126,10 @@ public:
             }
             libInited.store(true);
         }
-    
+
         uint8_t cards[SKIQ_MAX_NUM_CARDS] = {0};
         uint8_t num = 0;
-    
+
         auto try_get = [&](skiq_xport_type_t x) -> int32_t {
             std::memset(cards, 0, sizeof(cards));
             num = 0;
@@ -134,13 +137,13 @@ public:
             flog::info("Sidekiq: get_cards(xport={}, rc={}, num={})", (int)x, (int)rc, (int)num);
             return rc;
         };
-    
+
         // Prefer PCIe; if it errors OR finds zero, try AUTO.
         int32_t st = try_get(skiq_xport_type_pcie);
         if (st != 0 || num == 0) st = try_get(skiq_xport_type_auto);
-    
+
         devices.clear();
-    
+
         if (st != 0 || num == 0) {
             flog::warn("Sidekiq: no cards detected on PCIe/Auto (st={}, num={})", (int)st, (int)num);
             deviceIdx     = 0;
@@ -149,7 +152,7 @@ public:
             streamModeIdx = std::min(streamModeIdx, std::max(0, modes.size()-1));
             return;
         }
-    
+
         // Try BASIC to read serials, but ALWAYS list devices even if BASIC fails/EBUSY.
         bool basicEnabled = false;
         {
@@ -160,7 +163,7 @@ public:
                 flog::warn("Sidekiq: enable_cards(BASIC) failed ({}); proceeding without serials", (int)st_en);
             }
         }
-    
+
         std::unordered_set<std::string> seenKeys;
         for (uint8_t i = 0; i < num; ++i) {
             std::string key;
@@ -178,11 +181,11 @@ public:
                 devices.define(key, key, cards[i]);
             }
         }
-    
+
         if (basicEnabled) {
             (void)skiq_disable_cards(cards, num);
         }
-    
+
         deviceIdx     = std::min(deviceIdx,     std::max(0, devices.size()-1));
         handleIdx     = std::min(handleIdx,     std::max(0, handles.size()-1));
         rfPortIdx     = std::min(rfPortIdx,     std::max(0, rfPorts.size()-1));
@@ -236,6 +239,7 @@ private:
             SmGui::Text("No Sidekiq devices found. Plug in and click Refresh.");
         } else {
             if (SmGui::Combo(CONCAT_STR("Device##_sidekiq_dev_", s->name), &s->deviceIdx, s->devices.txt)) {
+                // Device changed -> clear/refresh dependent lists
                 g_config.acquire();
                 g_config.conf["device"] = s->devices.key(s->deviceIdx);
                 g_config.release(true);
@@ -246,7 +250,13 @@ private:
         // RX handle (LOCKED while running)
         SmGui::FillWidth();
         if (!s->handles.empty()) {
-            (void)SmGui::Combo(CONCAT_STR("RX Handle##_sidekiq_hdl_", s->name), &s->handleIdx, s->handles.txt);
+            int prevHandleIdx = s->handleIdx;
+            if (SmGui::Combo(CONCAT_STR("RX Handle##_sidekiq_hdl_", s->name), &s->handleIdx, s->handles.txt)) {
+                if (prevHandleIdx != s->handleIdx) {
+                    // Re-enumerate RF ports for new handle, preserving selection
+                    s->enumerateRfPorts(s->devices.value(s->deviceIdx), s->handles.value(s->handleIdx));
+                }
+            }
         } else {
             SmGui::Text("No RX handles (select a device).");
         }
@@ -260,70 +270,67 @@ private:
             g_config.release(true);
         }
 
-        // ---- Optional NV100-style profiles ----
-        SmGui::LeftLabel("Use profiles (SR/BW)");
+        // ---- NV100/NVM2 presets (no reprogramming) ----
+        s->detectNvSupport(); // set nvProfilesEnabled based on current device
+
+        SmGui::LeftLabel("Use presets (NV100/NVM2)");
         SmGui::FillWidth();
         {
-            bool up = s->useProfiles;
-            if (SmGui::Checkbox(CONCAT_STR("##_sidekiq_useprof_", s->name), &up)) {
-                s->useProfiles = up;
-                s->saveProfilesConfig();
+            bool up = s->useProfiles && s->nvProfilesEnabled;
+            bool checkbox = up;
+            if (SmGui::Checkbox(CONCAT_STR("##_sidekiq_useprof_", s->name), &checkbox)) {
+                // Only allow enabling if device supports NV presets
+                s->useProfiles = checkbox && s->nvProfilesEnabled;
+                s->saveNvPresetConfig();
+            }
+            if (!s->nvProfilesEnabled) {
+                SmGui::SameLine();
+                SmGui::TextDisabled("(not supported for this device)");
             }
         }
-        if (s->useProfiles) {
-            SmGui::LeftLabel("Profiles file (JSON)");
+
+        if (s->useProfiles && s->nvProfilesEnabled) {
+            // Supported NV100/NVM2 sample rates (from SDK manual)
+            static const uint32_t nvRatesHz[] = {
+                250000, 541667, 740740, 750000, 1000000, 1920000, 2457600, 2500000, 2800000,
+                3840000, 4000000, 4915200, 5000000, 5600000, 7680000, 9830400, 10000000, 11200000,
+                15360000, 16000000, 20000000, 21666700, 22000000, 23040000, 30720000, 40000000, 61440000
+            };
+            // Build items string (Msps text)
+            std::string rateItems;
+            int rateIdx = 0, curIdx = 0;
+            for (auto hz : nvRatesHz) {
+                double msps = hz / 1e6;
+                char tmp[32]; std::snprintf(tmp, sizeof(tmp), "%.6g Msps", msps);
+                rateItems += tmp; rateItems.push_back('\0');
+                if ((int)hz == (int)s->nvSelectedRateHz) curIdx = rateIdx;
+                ++rateIdx;
+            }
+            rateItems.push_back('\0');
+            SmGui::LeftLabel("Sample rate");
             SmGui::FillWidth();
-            static char pathBuf[512];
-            std::snprintf(pathBuf, sizeof(pathBuf), "%s", s->profilesPath.c_str());
-            if (SmGui::InputText(CONCAT_STR("##_sidekiq_profpath_", s->name), pathBuf, sizeof(pathBuf))) {
-                s->profilesPath = pathBuf;
-                s->saveProfilesConfig();
+            if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_sr_", s->name), &curIdx, rateItems.c_str())) {
+                // map back to Hz
+                s->nvSelectedRateHz = nvRatesHz[std::min<int>(curIdx, (int)(sizeof(nvRatesHz)/sizeof(nvRatesHz[0])-1))];
+                s->saveNvPresetConfig();
             }
-            SmGui::SameLine();
-            if (SmGui::Button(CONCAT_STR("Load##_sidekiq_profload_", s->name))) {
-                if (!s->profilesPath.empty()) {
-                    if (!s->loadProfilesFromJson(s->profilesPath.c_str())) {
-                        flog::error("Sidekiq: failed to load profiles from '{}'", s->profilesPath);
-                    }
-                }
+
+            // Bandwidth as % of sample rate (NV supports 5–80% in 0.5% steps; plus a few >80) — we’ll clamp to 3–99 to be safe
+            SmGui::LeftLabel("Rx bandwidth (% of SR)");
+            SmGui::FillWidth();
+            int bwp = std::clamp((int)s->nvBwPercent, 3, 99);
+            if (SmGui::SliderInt(CONCAT_STR("##_sidekiq_nv_bwpc_", s->name), &bwp, 3, 99)) {
+                s->nvBwPercent = bwp;
+                s->saveNvPresetConfig();
             }
-            if (!s->profiles.empty()) {
-                SmGui::LeftLabel("Profile");
-                SmGui::FillWidth();
-                // Build items string (ImGui zero-separated)
-                std::string items;
-                for (auto& p : s->profiles) { items += p.name; items.push_back('\0'); }
-                items.push_back('\0');
-                int idx = s->profileIdx;
-                if (SmGui::Combo(CONCAT_STR("##_sidekiq_profsel_", s->name), &idx, items.c_str())) {
-                    s->profileIdx = std::clamp(idx, 0, (int)s->profiles.size()-1);
-                    s->saveProfilesConfig();
-                    // Live apply if running
-                    if (s->running.load()) {
-                        const auto& pr = s->profiles[s->profileIdx];
-                        int32_t rc = skiq_write_rx_sample_rate_and_bandwidth(
-                            s->activeCard, s->activeRxHdl, pr.sample_rate, pr.bandwidth);
-                        if (rc != 0) {
-                            flog::warn("Sidekiq: applying profile '{}' failed rc={}", pr.name, (int)rc);
-                        } else {
-                            s->sampleRate = (int)pr.sample_rate;
-                            s->bandwidth  = (int)pr.bandwidth;
-                            core::setInputSampleRate(s->sampleRate);
-                            flog::info("Sidekiq: applied profile '{}' (SR={}, BW={})",
-                                       pr.name, pr.sample_rate, pr.bandwidth);
-                        }
-                    }
-                }
-            } else {
-                SmGui::Text("No profiles loaded.");
-            }
+
             ImGui::Separator();
         }
 
-        // Sample rate (LOCKED while running; hidden when profiles are used)
+        // Sample rate (hidden while NV presets are used)
         SmGui::LeftLabel("Sample rate (Hz)");
         SmGui::FillWidth();
-        if (!s->useProfiles) {
+        if (!(s->useProfiles && s->nvProfilesEnabled)) {
             int sr_tmp = (int)s->sampleRate;
             if (SmGui::InputInt(CONCAT_STR("##_sidekiq_sr_", s->name), &sr_tmp)) {
                 s->sampleRate = std::max(100000, sr_tmp);
@@ -334,10 +341,10 @@ private:
             }
         }
 
-        // Bandwidth (LOCKED while running; hidden when profiles are used)
+        // Bandwidth (hidden while NV presets are used)
         SmGui::LeftLabel("Chan bandwidth (Hz)");
         SmGui::FillWidth();
-        if (!s->useProfiles) {
+        if (!(s->useProfiles && s->nvProfilesEnabled)) {
             int bw_tmp = (int)s->bandwidth;
             if (SmGui::InputInt(CONCAT_STR("##_sidekiq_bw_", s->name), &bw_tmp)) {
                 s->bandwidth = std::max(100000, bw_tmp);
@@ -347,11 +354,16 @@ private:
             }
         }
 
-        // RF Port (LOCKED while running)
+        // RF Port (LOCKED while running) — persist selection
         if (!s->rfPorts.empty()) {
             SmGui::LeftLabel("RF Port");
             SmGui::FillWidth();
-            (void)SmGui::Combo(CONCAT_STR("##_sidekiq_rfport_", s->name), &s->rfPortIdx, s->rfPorts.txt);
+            int prevIdx = s->rfPortIdx;
+            if (SmGui::Combo(CONCAT_STR("##_sidekiq_rfport_", s->name), &s->rfPortIdx, s->rfPorts.txt)) {
+                if (prevIdx != s->rfPortIdx) {
+                    s->saveRfPortChoice();
+                }
+            }
         }
         if (s->running.load()) SmGui::EndDisabled();
 
@@ -370,7 +382,6 @@ private:
                 g_config.release(true);
                 if (s->running.load()) {
                     (void)skiq_write_rx_gain_mode(s->activeCard, s->activeRxHdl, s->gainMode);
-                    // If switching to manual, immediately push current index (clamped)
                     if (s->gainMode == skiq_rx_gain_manual) {
                         uint8_t gi8 = (uint8_t)std::clamp(s->gainIndex, (int)s->gainMin, (int)s->gainMax);
                         int32_t rc = skiq_write_rx_gain(s->activeCard, s->activeRxHdl, gi8);
@@ -388,10 +399,9 @@ private:
         SmGui::FillWidth();
         {
             if (s->gainMode != skiq_rx_gain_manual) SmGui::BeginDisabled();
-            // Use discovered range once running; before start, show a safe placeholder range
             int rangeMin = s->running.load() ? (int)s->gainMin : 0;
             int rangeMax = s->running.load() ? (int)s->gainMax : 76;
-            if (rangeMax < rangeMin) { rangeMin = 0; rangeMax = 76; } // guard
+            if (rangeMax < rangeMin) { rangeMin = 0; rangeMax = 76; }
             int gi = std::clamp(s->gainIndex, rangeMin, rangeMax);
             if (SmGui::SliderInt(CONCAT_STR("##_sidekiq_gainidx_", s->name), &gi, rangeMin, rangeMax)) {
                 s->gainIndex = gi;
@@ -416,11 +426,15 @@ private:
 
     // ===== helpers =====
     void enumerateHandlesForCard(uint8_t card) {
+        // preserve current selection when possible
+        skiq_rx_hdl_t wanted = (!handles.empty() && handleIdx >= 0 && handleIdx < handles.size())
+                               ? handles.value(handleIdx)
+                               : skiq_rx_hdl_A1;
+
         handles.clear();
 
         skiq_param_t param{};
         if (skiq_read_parameters(card, &param) != 0) {
-            // Generic fallback
             addHandleUnique("A1", skiq_rx_hdl_A1);
             addHandleUnique("A2", skiq_rx_hdl_A2);
             addHandleUnique("B1", skiq_rx_hdl_B1);
@@ -443,10 +457,14 @@ private:
                 if (label && seen.insert(label).second) handles.define(label, label, h);
             }
         }
+        // restore selection if still present
         handleIdx = 0;
+        for (int i = 0; i < handles.size(); ++i) {
+            if (handles.value(i) == wanted) { handleIdx = i; break; }
+        }
 
-        // Also enumerate RF ports for the default handle (if any)
-        if (!handles.empty()) enumerateRfPorts(card, handles.value(0));
+        // Also enumerate RF ports for the selected handle
+        if (!handles.empty()) enumerateRfPorts(card, handles.value(handleIdx));
     }
 
     void addHandleUnique(const char* key, skiq_rx_hdl_t h) {
@@ -454,6 +472,12 @@ private:
     }
 
     void enumerateRfPorts(uint8_t card, skiq_rx_hdl_t hdl) {
+        // preserve previous logical port selection by name for this device
+        std::string devKey = devices.key(deviceIdx);
+        std::string prevPortName;
+        auto it = rfPortByDevice.find(devKey);
+        if (it != rfPortByDevice.end()) prevPortName = (std::string)it->second;
+
         rfPorts.clear();
 
         uint8_t num_fixed = 0, num_trx = 0;
@@ -463,25 +487,26 @@ private:
                                                          &num_fixed, fixed_list,
                                                          &num_trx, trx_list);
         if (st != 0) {
-            // Fallback for older images: list common J* ports
             addRfPortUnique(skiq_rf_port_J1);
             addRfPortUnique(skiq_rf_port_J2);
-            rfPortIdx = 0;
-            return;
+        } else {
+            std::unordered_set<int> seen;
+            auto addPort = [&](skiq_rf_port_t p){
+                if (seen.insert((int)p).second) {
+                    std::string key = rfPortName(p);
+                    if (!rfPorts.keyExists(key)) rfPorts.define(key, key, p);
+                }
+            };
+
+            for (uint8_t i = 0; i < num_fixed; ++i) addPort(fixed_list[i]);
+            for (uint8_t i = 0; i < num_trx;   ++i) addPort(trx_list[i]);
         }
 
-        std::unordered_set<int> seen;
-        auto addPort = [&](skiq_rf_port_t p){
-            if (seen.insert((int)p).second) {
-                std::string key = rfPortName(p);
-                if (!rfPorts.keyExists(key)) rfPorts.define(key, key, p);
-            }
-        };
-
-        for (uint8_t i = 0; i < num_fixed; ++i) addPort(fixed_list[i]);
-        for (uint8_t i = 0; i < num_trx;   ++i) addPort(trx_list[i]);
-
+        // Try to restore RF port by saved name; otherwise keep index 0
         rfPortIdx = 0;
+        if (!prevPortName.empty() && rfPorts.keyExists(prevPortName)) {
+            rfPortIdx = rfPorts.keyId(prevPortName);
+        }
     }
 
     void addRfPortUnique(skiq_rf_port_t p) {
@@ -543,7 +568,7 @@ private:
         handleIdx = std::min(handleIdx, std::max(0, handles.size()-1));
         activeRxHdl = handles.value(handleIdx);
 
-        // RF ports
+        // RF ports (preserve saved choice)
         enumerateRfPorts(activeCard, activeRxHdl);
         if (!rfPorts.empty()) {
             rfPortIdx = std::min(rfPortIdx, std::max(0, rfPorts.size()-1));
@@ -560,12 +585,10 @@ private:
                 gainMax = gmax;
                 flog::info("Sidekiq: RX gain index range for handle is {}..{}", (unsigned)gainMin, (unsigned)gainMax);
             } else {
-                // Fallback (will be overridden on success in future runs)
                 gainMin = 0;
                 gainMax = 76;
                 flog::warn("Sidekiq: read_rx_gain_index_range failed ({}), using fallback {}..{}", (int)grc, (unsigned)gainMin, (unsigned)gainMax);
             }
-            // If saved index is out of range, choose midpoint to avoid extreme start levels
             if (gainIndex < (int)gainMin || gainIndex > (int)gainMax) {
                 gainIndex = (int)gainMin + (int)((((int)gainMax - (int)gainMin) / 2));
                 flog::info("Sidekiq: Adjusted initial Rx gain index to midpoint {} within {}..{}", (unsigned)gainIndex, (unsigned)gainMin, (unsigned)gainMax);
@@ -575,27 +598,27 @@ private:
         // IQ order and RF setup
         (void)skiq_write_iq_order_mode(activeCard, skiq_iq_order_qi);
 
-        // Apply SR/BW either from profiles or from manual fields
-        if (useProfiles && !profiles.empty()) {
-            const auto& pr = profiles[std::clamp(profileIdx, 0, (int)profiles.size()-1)];
-            int32_t rc = skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl,
-                                                                 pr.sample_rate, pr.bandwidth);
+        // Apply SR/BW either from NV presets or from manual fields
+        detectNvSupport();
+        if (useProfiles && nvProfilesEnabled) {
+            // NV100/NVM2: bandwidth is % of SR
+            uint32_t sr = (uint32_t)nvSelectedRateHz;
+            // Clamp BW% into supported-ish range; the firmware will quantize as needed
+            double bw = (double)sr * (std::clamp(nvBwPercent, 3, 99) / 100.0);
+            int32_t rc = skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl, sr, (uint32_t)bw);
             if (rc != 0) {
-                flog::warn("Sidekiq: profile '{}' SR/BW write failed rc={}", pr.name, (int)rc);
+                flog::warn("Sidekiq: NV preset SR/BW write failed rc={}, falling back to previous SR/BW", (int)rc);
             } else {
-                sampleRate = (int)pr.sample_rate;
-                bandwidth  = (int)pr.bandwidth;
+                sampleRate = (int)sr;
+                bandwidth  = (int)bw;
                 core::setInputSampleRate(sampleRate);
-                flog::info("Sidekiq: using profile '{}' (SR={}, BW={})",
-                           pr.name, pr.sample_rate, pr.bandwidth);
+                flog::info("Sidekiq: using NV preset (SR={} Hz, BW≈{} Hz)", sr, (uint32_t)bw);
             }
         } else {
             int32_t rc_srbw =
                 skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl,
                                                         (uint32_t)sampleRate, (uint32_t)bandwidth);
             if (rc_srbw != 0) {
-                // NV100 (ADRV9002) uses fixed profiles; arbitrary SR/BW can be invalid.
-                // Don't fail start—leave the device’s existing profile in place.
                 flog::warn("Sidekiq: write_rx_sample_rate_and_bandwidth({}, {}) failed rc={} "
                            "(device may require a fixed profile; leaving existing SR/BW)",
                            (uint32_t)sampleRate, (uint32_t)bandwidth, (int)rc_srbw);
@@ -687,6 +710,40 @@ private:
     }
 
 private:
+    // Detect if current device supports NV presets (NV100 / NVM2)
+    void detectNvSupport() {
+        nvProfilesEnabled = false;
+        if (devices.empty()) return;
+        uint8_t card = devices.value(deviceIdx);
+
+        skiq_param_t param{};
+        if (skiq_read_parameters(card, &param) == 0) {
+            auto pt = param.card_param.part_type;
+            if (pt == skiq_nv100 || pt == skiq_nvm2) {
+                nvProfilesEnabled = true;
+            }
+        }
+    }
+
+    void saveNvPresetConfig() {
+        g_config.acquire();
+        g_config.conf["useProfiles"]      = useProfiles;
+        g_config.conf["nvSelectedRateHz"] = (int)nvSelectedRateHz;
+        g_config.conf["nvBwPercent"]      = (int)nvBwPercent;
+        g_config.release(true);
+    }
+
+    void saveRfPortChoice() {
+        if (devices.empty() || rfPorts.empty()) return;
+        std::string devKey = devices.key(deviceIdx);
+        std::string portKey = rfPorts.key(rfPortIdx);
+        rfPortByDevice[devKey] = portKey;
+        g_config.acquire();
+        g_config.conf["rfPortByDevice"] = rfPortByDevice;
+        g_config.release(true);
+    }
+
+private:
     struct Profile {
         std::string name;
         uint32_t    sample_rate;
@@ -724,63 +781,34 @@ private:
     uint8_t                gainMin;
     uint8_t                gainMax;
 
-    // Profiles
-    bool           useProfiles;
-    std::string    profilesPath;
-    std::vector<Profile> profiles;
-    int            profileIdx;
+    // NV presets state
+    bool        useProfiles;       // user toggle
+    bool        nvProfilesEnabled; // detected capability
+    uint32_t    nvSelectedRateHz;
+    int         nvBwPercent;
+
+    // Persist RF port per device (by name key, e.g., "J1")
+    json rfPortByDevice;
 
     std::thread       rxThread;
     std::atomic<bool> running{false};
     std::atomic<bool> libInited{false};
     bool enabled = true;
-
-    // ---- profiles helpers ----
-    bool loadProfilesFromJson(const char* path) {
-        profiles.clear();
-        std::ifstream f(path);
-        if (!f.good()) return false;
-        try {
-            json j; f >> j;
-            if (!j.contains("profiles") || !j["profiles"].is_array()) return false;
-            for (auto& p : j["profiles"]) {
-                Profile pr{};
-                pr.name        = p.value("name", "");
-                pr.sample_rate = p.value("sample_rate", 0u);
-                pr.bandwidth   = p.value("bandwidth", 0u);
-                if (!pr.name.empty() && pr.sample_rate > 0 && pr.bandwidth > 0) {
-                    profiles.push_back(pr);
-                }
-            }
-            if (profiles.empty()) return false;
-            profileIdx = std::min(profileIdx, (int)profiles.size()-1);
-            flog::info("Sidekiq: loaded {} profile(s) from '{}'", (int)profiles.size(), path);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-    void saveProfilesConfig() {
-        g_config.acquire();
-        g_config.conf["useProfiles"]  = useProfiles;
-        g_config.conf["profilesPath"] = profilesPath;
-        g_config.conf["profileIdx"]   = profileIdx;
-        g_config.release(true);
-    }
 };
 
 // ===== module glue =====
 MOD_EXPORT void _INIT_() {
     json def = json({});
-    def["device"]     = "";
-    def["streamMode"] = (int)skiq_rx_stream_mode_high_tput;
-    def["sampleRate"] = 10000000;
-    def["bandwidth"]  = 10000000;
-    def["gainMode"]   = 0;   // 0=manual, 1=auto
-    def["gainIndex"]  = 30;
-    def["useProfiles"]  = false;
-    def["profilesPath"] = "";
-    def["profileIdx"]   = 0;
+    def["device"]          = "";
+    def["streamMode"]      = (int)skiq_rx_stream_mode_high_tput;
+    def["sampleRate"]      = 10000000;
+    def["bandwidth"]       = 10000000;
+    def["gainMode"]        = 0;   // 0=manual, 1=auto
+    def["gainIndex"]       = 30;
+    def["useProfiles"]     = false;
+    def["nvSelectedRateHz"]= 10000000;
+    def["nvBwPercent"]     = 50;
+    def["rfPortByDevice"]  = json::object();
 
     g_config.setPath(core::args["root"].s() + "/sidekiq_config.json");
     g_config.load(def);
