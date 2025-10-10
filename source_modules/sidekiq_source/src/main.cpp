@@ -25,6 +25,7 @@
 #include <fstream>
 #include <map>
 #include <chrono>
+#include <mutex>
 
 #define CONCAT_STR(a, b) ((std::string(a) + b).c_str())
 
@@ -32,7 +33,7 @@ SDRPP_MOD_INFO{
     /* Name:            */ "sidekiq_source",
     /* Description:     */ "Epiq Sidekiq source module for SDR++",
     /* Author:          */ "Aaron",
-    /* Version:         */ 0, 1, 0,
+    /* Version:         */ 0, 2, 2,
     /* Max instances    */ 1
 };
 
@@ -62,18 +63,18 @@ public:
         gainMin    = 0;
         gainMax    = 76;
 
-        // NV presets / state
+        // Presets / NV state
         useProfiles        = false;
         nvProfilesEnabled  = false;
         nvSelectedRateHz   = 10'000'000;
-        nvBwPresetHz       = 8'000'000;  // 80%
+        nvBwPresetHz       = 8'000'000; // 80%
 
         // Stream modes
         modes.define("High Throughput", "High Throughput", skiq_rx_stream_mode_high_tput);
         modes.define("Low Latency",     "Low Latency",     skiq_rx_stream_mode_low_latency);
         modes.define("Balanced",        "Balanced",        skiq_rx_stream_mode_balanced);
 
-        refreshDevices(); // initial probe
+        refreshDevices();
 
         // Restore config
         g_config.acquire();
@@ -104,63 +105,31 @@ public:
     ~SidekiqSourceModule() {
         stopStream();
         sigpath::sourceManager.unregisterSource("Sidekiq");
-        if (libInited.load()) { skiq_exit(); libInited.store(false); }
+        safeExitSdk();
     }
 
     void postInit() {}
+
     void enable()  { enabled = true;  }
     void disable() { enabled = false; }
     bool isEnabled() { return enabled; }
 
-    // --- helpers for snapshots / reset ---
-    static std::vector<uint8_t> cardsVector(uint8_t* ids, uint8_t n) {
-        return std::vector<uint8_t>(ids, ids + n);
-    }
-    static bool differ(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
-        if (a.size() != b.size()) return true;
-        for (size_t i=0;i<a.size();++i) if (a[i]!=b[i]) return true;
-        return false;
-    }
-    void sdkReset() {
-        if (running.load()) return;
-        if (libInited.load()) {
-            skiq_exit();
-            libInited.store(false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        }
-        int32_t st_init = skiq_init_without_cards();
-        if (st_init != 0) {
-            flog::error("Sidekiq: init_without_cards failed ({})", (int)st_init);
+    // Enumerate cards (prefer PCIe). Also resets the SDK if the topology changed so serial mappings don't linger.
+    void refreshDevices(bool allow_short_retry = true) {
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
+
+        // Cooldown after stop/unplug to avoid SDK touching a disappearing card
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastStopOrUnplug_ < std::chrono::milliseconds(3000)) {
+            flog::info("Sidekiq: cooldown after stop/unplug; skipping SDK probe this refresh");
+            devices.clear();
+            hadAnyDevice = false;
+            deviceIdx = handleIdx = rfPortIdx = 0;
+            lastCardSet_.clear();
             return;
         }
-        libInited.store(true);
-    }
 
-    // Enable BASIC if needed to probe params
-    bool ensureBasicEnabled(uint8_t card) {
-        skiq_param_t tmp{};
-        if (skiq_read_parameters(card, &tmp) == 0) return false; // already enabled
-        bool weEnabled = false;
-        (void)enableCardWithRetry(card, skiq_xport_init_level_basic, weEnabled, 8, 100);
-        return weEnabled;
-    }
-    void disableIfWeEnabled(uint8_t card, bool weEnabled) {
-        if (!weEnabled) return;
-        uint8_t list[1] = { card };
-        (void)skiq_disable_cards(list, 1);
-    }
-
-    // Validate that a card id actually responds; filter out “ghosts”
-    bool validateCard(uint8_t card) {
-        bool weEnabled = ensureBasicEnabled(card);
-        skiq_param_t param{};
-        int rc = skiq_read_parameters(card, &param);
-        disableIfWeEnabled(card, weEnabled);
-        return (rc == 0);
-    }
-
-    // Enumerate cards (AUTO), filter ghosts, avoid SDK churn when none present
-    void refreshDevices(bool allow_short_retry = true) {
+        // Init SDK if needed
         if (!libInited.load()) {
             int32_t st_init = skiq_init_without_cards();
             if (st_init != 0) {
@@ -178,92 +147,82 @@ public:
             return rc;
         };
 
-        uint8_t raw[SKIQ_MAX_NUM_CARDS] = {0};
+        // First probe
+        uint8_t cards[SKIQ_MAX_NUM_CARDS] = {0};
         uint8_t num = 0;
-        int32_t st = do_get(skiq_xport_type_auto, num, raw);
+        int32_t st = do_get(skiq_xport_type_pcie, num, cards);
+        if (st != 0 || num == 0) st = do_get(skiq_xport_type_auto, num, cards);
+
+        // Short retry if 0
         if (allow_short_retry && (st == 0 && num == 0)) {
             for (int i = 0; i < 5; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                st = do_get(skiq_xport_type_auto, num, raw);
+                st = do_get(skiq_xport_type_auto, num, cards);
                 if (st == 0 && num > 0) break;
             }
         }
 
-        // No cards: clear state and bail — NO SDK reset here.
-        if (st == 0 && num == 0) {
-            flog::info("Sidekiq: no cards present (clearing UI; no reset)");
-            lastCardsSnapshot.clear();
+        // Compare topology with last seen
+        auto curSet = toVec(cards, num);
+        bool topoChanged = (curSet != lastCardSet_);
 
-            devices.clear();
-            handles.clear();
-            rfPorts.clear();
-
+        if (topoChanged) {
+            flog::info("Sidekiq: card topology changed -> reinit SDK");
+            // Full reset so lib forgets previous serial↔slot mapping
+            safeExitSdk();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            int32_t st_init = skiq_init_without_cards();
+            if (st_init != 0) {
+                flog::error("Sidekiq: reinit after topology change failed ({})", (int)st_init);
+                devices.clear();
+                hadAnyDevice = false;
+                lastCardSet_.clear();
+                return;
+            }
+            libInited.store(true);
             knownSerialByCard.clear();
-            activeSerial.clear();
+            firstSeen.clear();
 
-            deviceIdx = handleIdx = rfPortIdx = 0;
-            cardIsEnabled = false;
-            activeCard = 0;
-            activeRxHdl = skiq_rx_hdl_A1;
-            return;
+            // Re-probe once from a clean slate
+            std::memset(cards, 0, sizeof(cards));
+            num = 0;
+            st = do_get(skiq_xport_type_auto, num, cards);
+            curSet = toVec(cards, num);
         }
 
-        // Consider topology change (raw)
-        std::vector<uint8_t> nowSnap = cardsVector(raw, num);
-        if (differ(nowSnap, lastCardsSnapshot)) {
-            flog::info("Sidekiq: card topology changed -> reinit SDK once");
-            sdkReset();
-            // Re-enumerate immediately post-reset
-            std::memset(raw, 0, sizeof(raw)); num = 0;
-            (void)do_get(skiq_xport_type_auto, num, raw);
-            nowSnap = cardsVector(raw, num);
-        }
-
-        // Filter out “ghost” ids that fail a basic parameter read
-        std::vector<uint8_t> valid;
-        valid.reserve(num);
-        for (uint8_t i = 0; i < num; ++i) {
-            if (validateCard(raw[i])) valid.push_back(raw[i]);
-            else flog::warn("Sidekiq: ignoring unstable/invalid card-{} during refresh", (unsigned)raw[i]);
-        }
-
-        // If filtering leaves zero, treat as no devices (still no reset)
-        if (valid.empty()) {
-            flog::info("Sidekiq: no valid cards after filtering (likely unplug in progress)");
-            lastCardsSnapshot.clear();
-
-            devices.clear();
-            handles.clear();
-            rfPorts.clear();
-
-            activeSerial.clear();
-            deviceIdx = handleIdx = rfPortIdx = 0;
-            cardIsEnabled = false;
-            activeCard = 0;
-            activeRxHdl = skiq_rx_hdl_A1;
-            return;
-        }
-
-        // Snapshot is now the validated set
-        lastCardsSnapshot = valid;
-
+        lastCardSet_ = curSet;
         devices.clear();
-        handles.clear();
-        rfPorts.clear();
 
+        if (st != 0 || num == 0) {
+            flog::warn("Sidekiq: no cards detected (st={}, num={})", (int)st, (int)num);
+            hadAnyDevice = false;
+            deviceIdx     = 0;
+            handleIdx     = 0;
+            rfPortIdx     = 0;
+            streamModeIdx = std::min(streamModeIdx, std::max(0, modes.size()-1));
+            // If nothing is present, also clear SDK so the next plug-in starts fresh
+            safeExitSdk();
+            lastCardSet_.clear();
+            return;
+        }
+        hadAnyDevice = true;
+
+        // Just list cards; do not enable or read params here
         std::unordered_set<std::string> seenKeys;
-        auto now = std::chrono::steady_clock::now();
-        for (uint8_t cid : valid) {
-            if (!firstSeen.count(cid)) firstSeen[cid] = now;
+        auto tnow = std::chrono::steady_clock::now();
+        for (uint8_t i = 0; i < num; ++i) {
+            uint8_t cid = cards[i];
+            if (!firstSeen.count(cid)) firstSeen[cid] = tnow;
 
             char tmp[32]; std::snprintf(tmp, sizeof(tmp), "card-%u", cid);
-            std::string key = tmp;
+            std::string key  = tmp;
             std::string disp = key;
 
             auto itSer = knownSerialByCard.find(cid);
             if (itSer != knownSerialByCard.end() && !itSer->second.empty()) {
                 disp = itSer->second + " (" + key + ")";
             }
+
             if (seenKeys.insert(key).second) {
                 devices.define(key, disp.c_str(), cid);
             }
@@ -273,15 +232,21 @@ public:
         handleIdx     = std::min(handleIdx,     std::max(0, handles.size()-1));
         rfPortIdx     = std::min(rfPortIdx,     std::max(0, rfPorts.size()-1));
         streamModeIdx = std::min(streamModeIdx, std::max(0, modes.size()-1));
-
-        if (!devices.empty()) {
-            detectNvSupport(); // safe: uses BASIC probe with guards
-        }
     }
 
     void reinitAndRescan() {
-        if (running.load()) return;
-        sdkReset();
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
+        safeExitSdk();
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        int32_t st_init = skiq_init_without_cards();
+        if (st_init != 0) {
+            flog::error("Sidekiq: reinit failed ({})", (int)st_init);
+            return;
+        }
+        libInited.store(true);
+        knownSerialByCard.clear();
+        firstSeen.clear();
+        lastCardSet_.clear();
         refreshDevices(/*allow_short_retry=*/true);
     }
 
@@ -307,6 +272,7 @@ private:
     static void onTune(double freq, void* ctx) {
         auto* s = static_cast<SidekiqSourceModule*>(ctx);
         s->centerFreq = static_cast<uint64_t>(freq);
+        std::lock_guard<std::recursive_mutex> lk(s->sdkMtx);
         if (s->running.load()) {
             (void)skiq_write_rx_LO_freq(s->activeCard, s->activeRxHdl, s->centerFreq);
         }
@@ -317,28 +283,14 @@ private:
     static void onMenu(void* ctx) {
         auto* s = static_cast<SidekiqSourceModule*>(ctx);
 
-        // Handle deferred actions first to avoid mid-frame churn
-        if (s->pendingReinit) {
-            s->pendingReinit = false;
-            s->reinitAndRescan();
-            return;
-        }
-        if (s->pendingRefresh) {
-            s->pendingRefresh = false;
-            s->refreshDevices();
-            return;
-        }
-
         // Refresh & Re-scan (reinit)
         SmGui::FillWidth();
         if (SmGui::Button(CONCAT_STR("Refresh##_sidekiq_refr_", s->name))) {
-            s->pendingRefresh = true;
-            return;
+            s->refreshDevices();
         }
         SmGui::SameLine();
         if (SmGui::Button(CONCAT_STR("Re-scan (reinit)##_sidekiq_reinit_", s->name))) {
-            s->pendingReinit = true;
-            return;
+            s->reinitAndRescan();
         }
 
         // Device dropdown (LOCKED while running)
@@ -353,7 +305,6 @@ private:
                 g_config.acquire();
                 g_config.conf["device"] = s->devices.key(s->deviceIdx);
                 g_config.release(true);
-                s->detectNvSupport();
                 s->enumerateHandlesForCard(s->devices.value(s->deviceIdx));
             }
         }
@@ -391,7 +342,7 @@ private:
             g_config.release(true);
         }
 
-        // ---- Tuning controls ----
+        // ---- Tuning controls: NV presets OR manual ----
         auto drawManualSRBW = [&](){
             SmGui::LeftLabel("Sample rate (Hz)");
             SmGui::FillWidth();
@@ -416,42 +367,42 @@ private:
         };
 
         auto drawNvPresets = [&](){
-            // EXACT rate list you provided; Quick presets = 80% BW
-            static const uint32_t nvRatesHz[] = {
-                250000, 541667, 740740, 750000, 1000000, 1920000, 2457600, 2500000, 2800000,
-                3840000, 4000000, 4915200, 5000000, 5600000, 7680000, 9830400, 10000000, 11200000,
-                15360000, 16000000, 20000000, 21666700, 22000000, 23040000, 30720000, 40000000, 61440000
+            // Curated pairs
+            struct Pair { uint32_t sr; uint32_t bw; const char* label; };
+            static const Pair knownPairs[] = {
+                {  250000,   155000,  "0.25 Msps / 155 kHz" },
+                {  740740,   400000,  "0.74074 Msps / 400 kHz" },
+                {  750000,   450000,  "0.75 Msps / 450 kHz" },
+                { 1000000,   800000,  "1 Msps / 800 kHz" },
+                { 2500000,  2000000,  "2.5 Msps / 2 MHz" },
+                { 5000000,  4000000,  "5 Msps / 4 MHz" },
+                {61440000, 50000000,  "61.44 Msps / 50 MHz (example)" },
             };
-            auto bw80 = [](uint32_t sr){ return (uint32_t)((sr * 80u) / 100u); };
-
             int curIdx = 0, idx = 0;
             std::string pairItems;
-            for (const auto& sr : nvRatesHz) {
-                uint32_t bw = bw80(sr);
-                double msps = sr / 1e6;
-                char tmp[64];
-                if (bw >= 1000000)
-                    std::snprintf(tmp, sizeof(tmp), "%.6g Msps / %u MHz (80%%)", msps, (unsigned)(bw/1000000));
-                else
-                    std::snprintf(tmp, sizeof(tmp), "%.6g Msps / %u kHz (80%%)", msps, (unsigned)(bw/1000));
-                pairItems += tmp; pairItems.push_back('\0');
-                if ((int)sr == (int)s->nvSelectedRateHz) curIdx = idx;
+            for (const auto& p : knownPairs) {
+                pairItems += p.label; pairItems.push_back('\0');
+                if ((int)p.sr == (int)s->nvSelectedRateHz && (int)p.bw == (int)s->nvBwPresetHz) curIdx = idx;
                 ++idx;
             }
             pairItems.push_back('\0');
-
-            SmGui::LeftLabel("Quick presets (80% BW)");
+            SmGui::LeftLabel("Known-good SR/BW");
             SmGui::FillWidth();
-            if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_quick_", s->name), &curIdx, pairItems.c_str())) {
-                s->nvSelectedRateHz = nvRatesHz[curIdx];
-                s->nvBwPresetHz     = bw80(nvRatesHz[curIdx]);
+            if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_pair_", s->name), &curIdx, pairItems.c_str())) {
+                s->nvSelectedRateHz = knownPairs[curIdx].sr;
+                s->nvBwPresetHz     = knownPairs[curIdx].bw;
                 s->saveNvPresetConfig();
             }
 
-            // Advanced (default 80%)
+            // Advanced lists (known-good SRs + BW % with 80% default)
             SmGui::LeftLabel("Advanced");
             SmGui::FillWidth();
             if (ImGui::TreeNode(CONCAT_STR("##_sidekiq_nv_adv_", s->name))) {
+                static const uint32_t nvRatesHz[] = {
+                    250000, 541667, 740740, 750000, 1000000, 1920000, 2457600, 2500000, 2800000,
+                    3840000, 4000000, 4915200, 5000000, 5600000, 7680000, 9830400, 10000000, 11200000,
+                    15360000, 16000000, 20000000, 21666700, 22000000, 23040000, 30720000, 40000000, 61440000
+                };
                 std::string rateItems;
                 int ri = 0, rsel = 0;
                 for (auto hz : nvRatesHz) {
@@ -466,36 +417,18 @@ private:
                 SmGui::FillWidth();
                 if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_sr_", s->name), &rsel, rateItems.c_str())) {
                     s->nvSelectedRateHz = nvRatesHz[rsel];
-                    uint32_t bw_min = (uint32_t)(s->nvSelectedRateHz * 0.05);
-                    uint32_t bw_max = (uint32_t)(s->nvSelectedRateHz * 0.95);
-                    if (s->nvBwPresetHz < bw_min || s->nvBwPresetHz > bw_max) {
-                        s->nvBwPresetHz = (uint32_t)(s->nvSelectedRateHz * 0.80);
-                    }
                     s->saveNvPresetConfig();
                 }
 
                 static const int bwPercents[] = { 5, 10, 20, 40, 50, 60, 80, 86, 89, 95 };
-                auto pctToIdx = [&](int pct){
-                    for (int i=0;i<10;i++) if (bwPercents[i]==pct) return i;
-                    return 6; // 80%
-                };
-                int bsel = pctToIdx(80);
-                for (int i=0;i<10;i++){
-                    uint32_t test = (uint32_t)((double)s->nvSelectedRateHz * (bwPercents[i] / 100.0));
-                    if (std::abs((int)test - (int)s->nvBwPresetHz) <= (int)std::max(1000u, s->nvSelectedRateHz/1000u)) {
-                        bsel = i; break;
-                    }
-                }
-
                 std::string bwItems;
+                int bi = 0, bsel = 0;
                 for (auto pct : bwPercents) {
                     uint32_t hz = (uint32_t)((double)s->nvSelectedRateHz * (pct/100.0));
-                    char tmp[48];
-                    if (hz >= 1000000)
-                        std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u MHz)", pct, (unsigned)(hz/1000000));
-                    else
-                        std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u kHz)", pct, (unsigned)(hz/1000));
+                    char tmp[48]; std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u Hz)", pct, hz);
                     bwItems += tmp; bwItems.push_back('\0');
+                    if ((int)hz == (int)s->nvBwPresetHz) bsel = bi;
+                    ++bi;
                 }
                 bwItems.push_back('\0');
                 SmGui::LeftLabel("Bandwidth");
@@ -534,7 +467,7 @@ private:
         }
         if (s->running.load()) SmGui::EndDisabled();
 
-        // ---- LIVE controls ----
+        // ---- Live controls ----
         SmGui::LeftLabel("Gain mode");
         SmGui::FillWidth();
         {
@@ -545,6 +478,8 @@ private:
                 g_config.acquire();
                 g_config.conf["gainMode"] = (int)gm;
                 g_config.release(true);
+
+                std::lock_guard<std::recursive_mutex> lk(s->sdkMtx);
                 if (s->running.load()) {
                     (void)skiq_write_rx_gain_mode(s->activeCard, s->activeRxHdl, s->gainMode);
                     if (s->gainMode == skiq_rx_gain_manual) {
@@ -568,6 +503,8 @@ private:
                 g_config.acquire();
                 g_config.conf["gainIndex"] = (int)s->gainIndex;
                 g_config.release(true);
+
+                std::lock_guard<std::recursive_mutex> lk(s->sdkMtx);
                 if (s->running.load() && s->gainMode == skiq_rx_gain_manual) {
                     uint8_t gi8 = (uint8_t)std::clamp(s->gainIndex, (int)s->gainMin, (int)s->gainMax);
                     (void)skiq_write_rx_gain(s->activeCard, s->activeRxHdl, gi8);
@@ -577,7 +514,7 @@ private:
         }
     }
 
-    // ===== device helpers =====
+    // ===== helpers =====
     int enableCardWithRetry(uint8_t card, skiq_xport_init_level_t lvl, bool& weEnabled,
                             int tries = 10, int sleep_ms = 100) {
         weEnabled = false;
@@ -586,7 +523,10 @@ private:
             int rc = skiq_enable_cards(list, 1, lvl);
             if (rc == 0)      { weEnabled = true; return 0; }
             if (rc == -EBUSY) { weEnabled = false; return 0; }
-            if (rc == -EINVAL) { std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms)); continue; }
+            if (rc == -EINVAL) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+                continue;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
         }
         return -EINVAL;
@@ -598,21 +538,16 @@ private:
     }
 
     void detectNvSupport() {
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
         nvProfilesEnabled = false;
         if (devices.empty()) return;
         uint8_t card = devices.value(deviceIdx);
+        if (!cardIsEnabled && !running.load()) return; // only detect when enabled
 
-        auto itFS = firstSeen.find(card);
-        if (itFS != firstSeen.end()) {
-            if (std::chrono::steady_clock::now() - itFS->second < std::chrono::milliseconds(2500)) return;
-        }
-
-        bool weEnabled = ensureBasicEnabled(card);
         skiq_param_t param{};
         if (skiq_read_parameters(card, &param) == 0) {
             if (isNvFamily(param)) nvProfilesEnabled = true;
         }
-        disableIfWeEnabled(card, weEnabled);
     }
 
     void enumerateHandlesForCard(uint8_t card) {
@@ -629,7 +564,7 @@ private:
             return;
         }
 
-        bool weEnabled = ensureBasicEnabled(card);
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
 
         skiq_rx_hdl_t wanted = (!handles.empty() && handleIdx >= 0 && handleIdx < handles.size())
                                ? handles.value(handleIdx)
@@ -667,8 +602,6 @@ private:
         }
 
         if (!handles.empty()) enumerateRfPorts(card, handles.value(handleIdx));
-
-        disableIfWeEnabled(card, weEnabled);
     }
 
     void addHandleUnique(const char* key, skiq_rx_hdl_t h) {
@@ -686,7 +619,7 @@ private:
             return;
         }
 
-        bool weEnabled = ensureBasicEnabled(card);
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
 
         std::string devKey = devices.key(deviceIdx);
         std::string prevPortName;
@@ -712,7 +645,6 @@ private:
                     if (!rfPorts.keyExists(key)) rfPorts.define(key, key, p);
                 }
             };
-
             for (uint8_t i = 0; i < num_fixed; ++i) addPort(fixed_list[i]);
             for (uint8_t i = 0; i < num_trx;   ++i) addPort(trx_list[i]);
         }
@@ -721,8 +653,6 @@ private:
         if (!prevPortName.empty() && rfPorts.keyExists(prevPortName)) {
             rfPortIdx = rfPorts.keyId(prevPortName);
         }
-
-        disableIfWeEnabled(card, weEnabled);
     }
 
     void addRfPortUnique(skiq_rf_port_t p) {
@@ -743,6 +673,7 @@ private:
     }
 
     void startStream() {
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
         if (running.load()) return;
 
         if (!libInited.load()) {
@@ -758,7 +689,7 @@ private:
 
         activeCard = devices.value(deviceIdx);
 
-        // Confirm selected card still exists
+        // Confirm selected card still present
         {
             uint8_t cards[SKIQ_MAX_NUM_CARDS] = {0};
             uint8_t num = 0;
@@ -771,6 +702,7 @@ private:
             }
         }
 
+        // Hot-plug settle
         auto now = std::chrono::steady_clock::now();
         auto itFS = firstSeen.find(activeCard);
         if (itFS != firstSeen.end()) {
@@ -795,6 +727,7 @@ private:
         }
         cardIsEnabled = weEnabledFull ? true : false;
 
+        // Serial for UI
         activeSerial.clear();
         {
             char* serial = nullptr;
@@ -805,30 +738,25 @@ private:
             }
         }
 
+        // Handles
         enumerateHandlesForCard(activeCard);
         if (handles.empty()) {
             flog::error("Sidekiq: no valid RX handles found on card {}", (unsigned)activeCard);
-            if (cardIsEnabled) {
-                uint8_t list[1] = { activeCard };
-                (void)skiq_disable_cards(list, 1);
-                cardIsEnabled = false;
-            }
+            if (cardIsEnabled) { uint8_t list[1] = { activeCard }; (void)skiq_disable_cards(list, 1); cardIsEnabled = false; }
             return;
         }
         handleIdx = std::min(handleIdx, std::max(0, handles.size()-1));
         activeRxHdl = handles.value(handleIdx);
 
+        // RF ports
         enumerateRfPorts(activeCard, activeRxHdl);
         if (!rfPorts.empty()) {
             rfPortIdx = std::min(rfPortIdx, std::max(0, rfPorts.size()-1));
             skiq_rf_port_t chosen = rfPorts.value(rfPortIdx);
-
             if (nvProfilesEnabled && chosen == skiq_rf_port_J2) {
                 (void)skiq_write_rf_port_config(activeCard, skiq_rf_port_config_trx);
             }
-
             (void)skiq_write_rx_rf_port_for_hdl(activeCard, activeRxHdl, chosen);
-
             skiq_rf_port_t actual;
             if (skiq_read_rx_rf_port_for_hdl(activeCard, activeRxHdl, &actual) == 0) {
                 if (actual != chosen) {
@@ -842,64 +770,39 @@ private:
             flog::warn("Sidekiq: no RF ports available after enable; skipping port write");
         }
 
+        // Gain range
         {
             uint8_t gmin = 0, gmax = 0;
             int32_t grc = skiq_read_rx_gain_index_range(activeCard, activeRxHdl, &gmin, &gmax);
-            if (grc == 0 && gmax >= gmin) {
-                gainMin = gmin;
-                gainMax = gmax;
-                flog::info("Sidekiq: RX gain index range for handle is {}..{}", (unsigned)gainMin, (unsigned)gainMax);
-            } else {
-                gainMin = 0;
-                gainMax = 76;
-                flog::warn("Sidekiq: read_rx_gain_index_range failed ({}), using fallback {}..{}", (int)grc, (unsigned)gainMin, (unsigned)gainMax);
-            }
+            if (grc == 0 && gmax >= gmin) { gainMin = gmin; gainMax = gmax; }
+            else { gainMin = 0; gainMax = 76; }
             if (gainIndex < (int)gainMin || gainIndex > (int)gainMax) {
                 gainIndex = (int)gainMin + (int)((((int)gainMax - (int)gainMin) / 2));
-                flog::info("Sidekiq: Adjusted initial Rx gain index to midpoint {} within {}..{}", (unsigned)gainIndex, (unsigned)gainMin, (unsigned)gainMax);
             }
         }
 
+        // IQ order
         (void)skiq_write_iq_order_mode(activeCard, skiq_iq_order_qi);
 
+        // SR/BW
         if (useProfiles && nvProfilesEnabled) {
-            uint32_t bw_min = (uint32_t)(nvSelectedRateHz * 0.05);
-            uint32_t bw_max = (uint32_t)(nvSelectedRateHz * 0.95);
-            if (nvBwPresetHz < bw_min || nvBwPresetHz > bw_max) {
-                nvBwPresetHz = (uint32_t)(nvSelectedRateHz * 0.80);
-            }
-            uint32_t sr = nvSelectedRateHz;
-            uint32_t bw = nvBwPresetHz;
-            int32_t rc = skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl, sr, bw);
-            if (rc != 0) {
-                flog::warn("Sidekiq: NV preset SR/BW write failed rc={}, leaving existing SR/BW", (int)rc);
-            } else {
+            uint32_t sr = (uint32_t)nvSelectedRateHz;
+            uint32_t bw = (uint32_t)nvBwPresetHz;
+            if (skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl, sr, bw) == 0) {
                 sampleRate = (int)sr;
                 bandwidth  = (int)bw;
                 core::setInputSampleRate(sampleRate);
-                flog::info("Sidekiq: using NV preset (SR={} Hz, BW={} Hz)", sr, (uint32_t)bw);
             }
         } else {
-            int32_t rc_srbw =
-                skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl,
-                                                        (uint32_t)sampleRate, (uint32_t)bandwidth);
-            if (rc_srbw != 0) {
-                flog::warn("Sidekiq: write_rx_sample_rate_and_bandwidth({}, {}) failed rc={} "
-                           "(device may require a fixed profile; leaving existing SR/BW)",
-                           (uint32_t)sampleRate, (uint32_t)bandwidth, (int)rc_srbw);
-            }
+            (void)skiq_write_rx_sample_rate_and_bandwidth(activeCard, activeRxHdl,
+                                                          (uint32_t)sampleRate, (uint32_t)bandwidth);
         }
 
         (void)skiq_write_rx_LO_freq(activeCard, activeRxHdl, centerFreq);
         (void)skiq_write_rx_gain_mode(activeCard, activeRxHdl, gainMode);
         if (gainMode == skiq_rx_gain_manual) {
             uint8_t gi8 = (uint8_t)std::clamp(gainIndex, (int)gainMin, (int)gainMax);
-            int32_t rc = skiq_write_rx_gain(activeCard, activeRxHdl, gi8);
-            if (rc != 0) {
-                flog::error("Sidekiq: failed to write initial Rx gain (index={}, status={})", (unsigned)gi8, (int)rc);
-            } else {
-                flog::info("Sidekiq: Initial Rx gain index set to {} (range {}..{})", (unsigned)gi8, (unsigned)gainMin, (unsigned)gainMax);
-            }
+            (void)skiq_write_rx_gain(activeCard, activeRxHdl, gi8);
         }
 
         (void)skiq_write_rx_stream_mode(activeCard, streamMode);
@@ -908,11 +811,7 @@ private:
         int32_t sst = skiq_start_rx_streaming(activeCard, activeRxHdl);
         if (sst != 0) {
             flog::error("Sidekiq: start_rx_streaming failed ({})", (int)sst);
-            if (cardIsEnabled) {
-                uint8_t list[1] = { activeCard };
-                (void)skiq_disable_cards(list, 1);
-                cardIsEnabled = false;
-            }
+            if (cardIsEnabled) { uint8_t list[1] = { activeCard }; (void)skiq_disable_cards(list, 1); cardIsEnabled = false; }
             return;
         }
 
@@ -923,15 +822,27 @@ private:
     }
 
     void stopStream() {
-        if (!running.load()) return;
+        // Note time first so Refresh knows to cool down
+        {
+            std::lock_guard<std::recursive_mutex> lk(sdkMtx);
+            lastStopOrUnplug_ = std::chrono::steady_clock::now();
+        }
+
+        if (!running.load()) {
+            // Still exit SDK so any live mapping is dropped
+            safeExitSdk();
+            return;
+        }
+
         running.store(false);
         if (rxThread.joinable()) rxThread.join();
+
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
 
         if (rxStreamingStarted) {
             (void)skiq_stop_rx_streaming(activeCard, activeRxHdl);
             rxStreamingStarted = false;
         }
-
         if (cardIsEnabled) {
             uint8_t list[1] = { activeCard };
             (void)skiq_disable_cards(list, 1);
@@ -939,16 +850,22 @@ private:
         }
 
         stream.clearWriteStop();
-
-        // Clear selection so accidental calls never use a stale id
-        activeCard = 0;
-        activeRxHdl = skiq_rx_hdl_A1;
-
         flog::info("SidekiqSource {}: Stop", name);
+
+        // reset state & fully exit SDK so next card starts from a blank slate
+        activeCard   = 0xFF;
+        activeRxHdl  = skiq_rx_hdl_A1;
+        hadAnyDevice = false;
+
+        safeExitSdk();
     }
 
     void rxLoop() {
-        int32_t blk_bytes = skiq_read_rx_block_size(activeCard, streamMode);
+        int32_t blk_bytes;
+        {
+            std::lock_guard<std::recursive_mutex> lk(sdkMtx);
+            blk_bytes = skiq_read_rx_block_size(activeCard, streamMode);
+        }
         if (blk_bytes <= 0) blk_bytes = 4096;
 
         const double scale = 1.0 / 2048.0; // 12-bit -> float
@@ -959,7 +876,12 @@ private:
             skiq_rx_hdl_t    hdl  = activeRxHdl;
             uint32_t         len  = 0;
 
-            skiq_rx_status_t st = skiq_receive(activeCard, &hdl, &pblk, &len);
+            skiq_rx_status_t st;
+            {
+                std::lock_guard<std::recursive_mutex> lk(sdkMtx);
+                st = skiq_receive(activeCard, &hdl, &pblk, &len);
+            }
+
             if (st == skiq_rx_status_success && pblk && len >= SKIQ_RX_HEADER_SIZE_IN_BYTES) {
                 const uint32_t payload_bytes = len - SKIQ_RX_HEADER_SIZE_IN_BYTES;
                 const uint32_t iq_pairs = payload_bytes / 4;
@@ -983,7 +905,21 @@ private:
         }
     }
 
+    void safeExitSdk() {
+        std::lock_guard<std::recursive_mutex> lk(sdkMtx);
+        if (libInited.load()) {
+            skiq_exit();
+            libInited.store(false);
+        }
+    }
+
+    static std::vector<uint8_t> toVec(const uint8_t* cards, uint8_t n) {
+        return std::vector<uint8_t>(cards, cards + n);
+    }
+
 private:
+    struct Profile { std::string name; uint32_t sample_rate; uint32_t bandwidth; };
+
     std::string name;
     SourceManager::SourceHandler handler;
     dsp::stream<dsp::complex_t> stream;
@@ -1015,32 +951,29 @@ private:
     uint8_t                gainMin;
     uint8_t                gainMax;
 
-    // NV presets state
+    // NV presets
     bool        useProfiles;
     bool        nvProfilesEnabled;
     uint32_t    nvSelectedRateHz;
     uint32_t    nvBwPresetHz;
 
-    // Persist RF port per device
     json rfPortByDevice;
 
-    // Hot-plug tracking
     std::map<uint8_t, std::chrono::steady_clock::time_point> firstSeen;
 
-    // UI status
     std::string activeSerial;
     std::map<uint8_t, std::string> knownSerialByCard;
-
-    // Last validated card list
-    std::vector<uint8_t> lastCardsSnapshot;
-
-    bool pendingRefresh = false;
-    bool pendingReinit  = false;
 
     std::thread       rxThread;
     std::atomic<bool> running{false};
     std::atomic<bool> libInited{false};
     bool enabled = true;
+
+    // SDK access serialization + teardown cooldown + last-topology
+    std::recursive_mutex sdkMtx;
+    bool hadAnyDevice = false;
+    std::chrono::steady_clock::time_point lastStopOrUnplug_{};
+    std::vector<uint8_t> lastCardSet_;
 
     void saveNvPresetConfig() {
         g_config.acquire();
