@@ -205,6 +205,8 @@ int sdrpp_main(int argc, char* argv[]) {
     defConfig["moduleInstances"]["SDR++ Server Source"]["enabled"] = true;
     defConfig["moduleInstances"]["Spectran HTTP Source"]["module"] = "spectran_http_source";
     defConfig["moduleInstances"]["Spectran HTTP Source"]["enabled"] = true;
+    defConfig["moduleInstances"]["Sidekiq Source"]["module"] = "sidekiq_source";
+    defConfig["moduleInstances"]["Sidekiq Source"]["enabled"] = true;
     defConfig["moduleInstances"]["SpyServer Source"]["module"] = "spyserver_source";
     defConfig["moduleInstances"]["SpyServer Source"]["enabled"] = true;
     defConfig["moduleInstances"]["USRP Source"]["module"] = "usrp_source";
