@@ -41,11 +41,13 @@ if (NOT DEFINED SUFFIX OR SUFFIX STREQUAL "")
     # Put x86 options FIRST so we don't get tricked by ARM libs bundled in x86 SDKs
     list(APPEND _prefer_list
       "x86_64.gcc"
-      "x86_64")
+      "x86_64"
+      "z4")      # prefer z4 if present
   elseif (_host_cpu MATCHES "aarch64|arm64")
     list(APPEND _prefer_list
       "aarch64.gcc6.3"
       "aarch64"
+      "z4"       # prefer z4 if present
       "arm_cortex-a9.gcc7.2.1_gnueabihf"
       "z3u")
   else()
@@ -53,6 +55,7 @@ if (NOT DEFINED SUFFIX OR SUFFIX STREQUAL "")
     list(APPEND _prefer_list
       "x86_64.gcc" "x86_64"
       "aarch64.gcc6.3" "aarch64"
+      "z4"
       "z3u")
   endif()
 
@@ -82,7 +85,7 @@ if (NOT DEFINED SUFFIX OR SUFFIX STREQUAL "")
     message(FATAL_ERROR
       "Could not determine Sidekiq SDK suffix for host '${_host_cpu}'. "
       "Checked in ${Sidekiq_ROOT}/lib. "
-      "Please pass -DSUFFIX=<suffix> (e.g. x86_64.gcc, aarch64, z3u).")
+      "Please pass -DSUFFIX=<suffix> (e.g. x86_64.gcc, aarch64, z3u, z4).")
   endif()
 
   set(SUFFIX "${_found_suffix}")
@@ -109,9 +112,9 @@ endif()
 # Derive support suffix from the actual archive (prevents mismatch).
 get_filename_component(_sklib_name "${Sidekiq_LIBRARY}" NAME)   # libsidekiq__*.a
 string(REPLACE "libsidekiq__" "" _support_sfx "${_sklib_name}")
-string(REPLACE ".a" "" _support_sfx "${_support_sfx}")          # e.g., aarch64.gcc6.3 | z3u
+string(REPLACE ".a" "" _support_sfx "${_support_sfx}")          # e.g., aarch64.gcc6.3 | z3u | z4
 
-# Compute a simple "type" like your working pkg banner (aarch64/x86_64/z3u/…)
+# Compute a simple "type" like your working pkg banner (aarch64/x86_64/z3u/z4/…)
 set(_arch_type "${_support_sfx}")
 string(REGEX REPLACE "\\..*$" "" _arch_type "${_arch_type}")
 
@@ -211,6 +214,39 @@ endif()
 # ---------------- Threads / dl / rt ------------------------------
 find_package(Threads REQUIRED)
 
+# ---------------- Z4-only override (shared .so + bundled gpiod) --
+set(_Z4_EXTRA_LIBS "")
+if (_support_sfx STREQUAL "z4")
+  # Prefer SDK shared sidekiq that matches support bundle
+  unset(Sidekiq_LIBRARY CACHE)
+  find_library(Sidekiq_LIBRARY
+    NAMES sidekiq-dev-z4-1 sidekiq
+    HINTS "${EPIQ_SUPP_LIB_DIR}" "${Sidekiq_ROOT}/lib"
+    NO_DEFAULT_PATH)
+  if (NOT Sidekiq_LIBRARY)
+    message(FATAL_ERROR "Z4: shared sidekiq .so not found in ${EPIQ_SUPP_LIB_DIR}; check your SDK install.")
+  endif()
+
+  # Ensure linker searches SDK dir BEFORE system
+  if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
+    target_link_directories(${MODULE_TARGET} BEFORE PRIVATE "${EPIQ_SUPP_LIB_DIR}")
+  endif()
+
+  # Resolve libgpiod from SDK bundle (v2)
+  find_library(GPIOD_SDK_LIBRARY NAMES gpiod HINTS "${EPIQ_SUPP_LIB_DIR}" NO_DEFAULT_PATH)
+  if (NOT GPIOD_SDK_LIBRARY)
+    message(FATAL_ERROR "Z4: libgpiod not found in ${EPIQ_SUPP_LIB_DIR}.")
+  endif()
+  set(_Z4_EXTRA_LIBS "${GPIOD_SDK_LIBRARY}")
+
+  # Runtime RPATH for SDK shared libs
+  if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
+    set_target_properties(${MODULE_TARGET} PROPERTIES
+      BUILD_RPATH   "${EPIQ_SUPP_LIB_DIR}"
+      INSTALL_RPATH "${EPIQ_SUPP_LIB_DIR}")
+  endif()
+endif()
+
 # ---------------- Target wiring ---------------------------------
 target_include_directories(${MODULE_TARGET} PRIVATE
   ${Sidekiq_INCLUDE_DIR}
@@ -233,9 +269,10 @@ target_link_directories(${MODULE_TARGET} PRIVATE
   ${LIBUSB_LIBRARY_DIRS}
 )
 
-# Link order: static sidekiq first, then deps
+# Link order: sidekiq first, then Z4 extras (if any), then deps
 target_link_libraries(${MODULE_TARGET} PRIVATE
   ${Sidekiq_LIBRARY}
+  ${_Z4_EXTRA_LIBS}
   ${GLIB2_LIBRARIES}
   ${TIRPC_LIBRARIES}
   ${LIBUSB_LIBRARIES}
@@ -280,5 +317,10 @@ message(STATUS "-- Sidekiq_LIBRARIES - ${Sidekiq_LIBRARY}")
 if (LIBIIO_LIBRARIES)
   message(STATUS "-- OTHER_LIBS - ${LIBIIO_LIBRARIES}")
 endif()
+if (_support_sfx STREQUAL "z4")
+  message(STATUS "-- Z4 extras - ${_Z4_EXTRA_LIBS}")
+  message(STATUS "-- RPATH - ${EPIQ_SUPP_LIB_DIR}")
+endif()
 message(STATUS "-- Using install prefix: ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")
+
