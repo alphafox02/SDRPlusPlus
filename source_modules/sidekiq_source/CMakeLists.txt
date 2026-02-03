@@ -247,6 +247,44 @@ if (_support_sfx STREQUAL "z4")
   endif()
 endif()
 
+# ---------------- X40 gRPC deps (SDK 4.24+) ----------------------
+set(_X40_GRPC_LIBS "")
+set(_X40_GRPC_LIB_DIRS "")
+if (_support_sfx STREQUAL "msiq-x40")
+  if (PkgConfig_FOUND)
+    pkg_check_modules(GRPCPP QUIET grpc++)
+    pkg_check_modules(GRPC QUIET grpc)
+  endif()
+
+  if (GRPCPP_FOUND)
+    list(APPEND _X40_GRPC_LIBS ${GRPCPP_LIBRARIES})
+    list(APPEND _X40_GRPC_LIB_DIRS ${GRPCPP_LIBRARY_DIRS})
+  endif()
+  if (GRPC_FOUND)
+    list(APPEND _X40_GRPC_LIBS ${GRPC_LIBRARIES})
+    list(APPEND _X40_GRPC_LIB_DIRS ${GRPC_LIBRARY_DIRS})
+  endif()
+
+  if (NOT _X40_GRPC_LIBS)
+    find_library(GRPCPP_LIBRARY NAMES grpc++ HINTS ${EPIQ_SUPP_LIB_DIR} /usr/lib/epiq NO_DEFAULT_PATH)
+    find_library(GRPC_LIBRARY   NAMES grpc   HINTS ${EPIQ_SUPP_LIB_DIR} /usr/lib/epiq NO_DEFAULT_PATH)
+    find_library(GPR_LIBRARY    NAMES gpr    HINTS ${EPIQ_SUPP_LIB_DIR} /usr/lib/epiq NO_DEFAULT_PATH)
+    find_library(PROTOBUF_LIBRARY NAMES protobuf HINTS ${EPIQ_SUPP_LIB_DIR} /usr/lib/epiq NO_DEFAULT_PATH)
+    if (NOT GRPCPP_LIBRARY OR NOT GRPC_LIBRARY OR NOT GPR_LIBRARY)
+      message(FATAL_ERROR "X40: gRPC libs not found in ${EPIQ_SUPP_LIB_DIR} (expected grpc++, grpc, gpr)")
+    endif()
+    list(APPEND _X40_GRPC_LIBS ${GRPCPP_LIBRARY} ${GRPC_LIBRARY} ${GPR_LIBRARY})
+    if (PROTOBUF_LIBRARY)
+      list(APPEND _X40_GRPC_LIBS ${PROTOBUF_LIBRARY})
+    endif()
+  endif()
+
+  # Prefer SDK libs before system
+  if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
+    target_link_directories(${MODULE_TARGET} BEFORE PRIVATE "${EPIQ_SUPP_LIB_DIR}")
+  endif()
+endif()
+
 # ---------------- Target wiring ---------------------------------
 target_include_directories(${MODULE_TARGET} PRIVATE
   ${Sidekiq_INCLUDE_DIR}
@@ -264,15 +302,17 @@ if (EXISTS "/usr/lib/epiq")
   target_link_directories(${MODULE_TARGET} PRIVATE "/usr/lib/epiq")
 endif()
 target_link_directories(${MODULE_TARGET} PRIVATE
+  ${_X40_GRPC_LIB_DIRS}
   ${GLIB2_LIBRARY_DIRS}
   ${TIRPC_LIBRARY_DIRS}
   ${LIBUSB_LIBRARY_DIRS}
 )
 
-# Link order: sidekiq first, then Z4 extras (if any), then deps
+# Link order: sidekiq first, then Z4/X40 extras, then deps
 target_link_libraries(${MODULE_TARGET} PRIVATE
   ${Sidekiq_LIBRARY}
   ${_Z4_EXTRA_LIBS}
+  ${_X40_GRPC_LIBS}
   ${GLIB2_LIBRARIES}
   ${TIRPC_LIBRARIES}
   ${LIBUSB_LIBRARIES}
@@ -321,6 +361,8 @@ if (_support_sfx STREQUAL "z4")
   message(STATUS "-- Z4 extras - ${_Z4_EXTRA_LIBS}")
   message(STATUS "-- RPATH - ${EPIQ_SUPP_LIB_DIR}")
 endif()
+if (_support_sfx STREQUAL "msiq-x40")
+  message(STATUS "-- X40 gRPC libs - ${_X40_GRPC_LIBS}")
+endif()
 message(STATUS "-- Using install prefix: ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")
-
