@@ -250,6 +250,7 @@ endif()
 # ---------------- X40 gRPC deps (SDK 4.24+) ----------------------
 set(_X40_GRPC_LIBS "")
 set(_X40_GRPC_LIB_DIRS "")
+set(_X40_EXTRA_LIBS "")
 if (_support_sfx STREQUAL "msiq-x40")
   if (PkgConfig_FOUND)
     pkg_check_modules(GRPCPP QUIET grpc++)
@@ -298,6 +299,16 @@ if (_support_sfx STREQUAL "msiq-x40")
 
   list(REMOVE_DUPLICATES _X40_GRPC_LIBS)
 
+  # X40 GPIO dependency
+  if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
+    find_library(GPIOD_SDK_LIBRARY NAMES gpiod HINTS "${EPIQ_SUPP_LIB_DIR}" NO_DEFAULT_PATH)
+    if (GPIOD_SDK_LIBRARY)
+      list(APPEND _X40_EXTRA_LIBS ${GPIOD_SDK_LIBRARY})
+    else()
+      message(FATAL_ERROR "X40: libgpiod not found in ${EPIQ_SUPP_LIB_DIR}")
+    endif()
+  endif()
+
   # Prefer SDK libs before system
   if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
     target_link_directories(${MODULE_TARGET} BEFORE PRIVATE "${EPIQ_SUPP_LIB_DIR}")
@@ -332,6 +343,7 @@ target_link_libraries(${MODULE_TARGET} PRIVATE
   ${Sidekiq_LIBRARY}
   ${_Z4_EXTRA_LIBS}
   ${_X40_GRPC_LIBS}
+  ${_X40_EXTRA_LIBS}
   ${GLIB2_LIBRARIES}
   ${TIRPC_LIBRARIES}
   ${LIBUSB_LIBRARIES}
