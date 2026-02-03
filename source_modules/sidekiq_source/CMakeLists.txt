@@ -279,6 +279,25 @@ if (_support_sfx STREQUAL "msiq-x40")
     endif()
   endif()
 
+  # Add SDK-bundled deps commonly required by grpc++
+  if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
+    file(GLOB _X40_GRPC_DEPS
+      "${EPIQ_SUPP_LIB_DIR}/libabsl_*.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libaddress_sorting.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libre2.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libupb.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libcares.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libssl.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libcrypto.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libprotobuf*.so*"
+      "${EPIQ_SUPP_LIB_DIR}/libz.so*")
+    if (_X40_GRPC_DEPS)
+      list(APPEND _X40_GRPC_LIBS ${_X40_GRPC_DEPS})
+    endif()
+  endif()
+
+  list(REMOVE_DUPLICATES _X40_GRPC_LIBS)
+
   # Prefer SDK libs before system
   if (EXISTS "${EPIQ_SUPP_LIB_DIR}")
     target_link_directories(${MODULE_TARGET} BEFORE PRIVATE "${EPIQ_SUPP_LIB_DIR}")
