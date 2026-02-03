@@ -4,6 +4,9 @@ project(sidekiq_source)
 # SDR++ expects SRC to be defined before including the module cmake.
 file(GLOB SRC "src/*.cpp")
 
+# Optional verbosity for dependency listings
+option(OPT_SIDEKIQ_VERBOSE_DEPS "Verbose Sidekiq dependency logging" OFF)
+
 # This include creates the target "sidekiq_source" for you.
 include(${SDRPP_MODULE_CMAKE})
 set(MODULE_TARGET sidekiq_source)
@@ -393,7 +396,12 @@ if (_support_sfx STREQUAL "z4")
   message(STATUS "-- RPATH - ${EPIQ_SUPP_LIB_DIR}")
 endif()
 if (_support_sfx STREQUAL "msiq-x40")
-  message(STATUS "-- X40 gRPC libs - ${_X40_GRPC_LIBS}")
+  list(LENGTH _X40_GRPC_LIBS _x40_grpc_lib_count)
+  if (OPT_SIDEKIQ_VERBOSE_DEPS)
+    message(STATUS "-- X40 gRPC libs - ${_X40_GRPC_LIBS}")
+  else()
+    message(STATUS "-- X40 gRPC libs - grpc++ grpc gpr protobuf (SDK bundle), resolved ${_x40_grpc_lib_count} entries")
+  endif()
 endif()
 message(STATUS "-- Using install prefix: ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")
