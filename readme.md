@@ -207,7 +207,7 @@ This branch includes a `sidekiq_source` module for Epiq Sidekiq hardware. In add
 
 Tested so far on this branch: Matchstiq G20, Matchstiq X40, and x86_64 host builds using `libsidekiq` 4.23.
 
-For a Matchstiq G40 system that is mainly meant to run headless and stream IQ over the network to another SDR++ GUI instance, the following package set has been tested:
+For a Matchstiq G40 system that is mainly meant to run at the edge, the following package set has been tested. The example below is a minimal headless build for cases where you want to make an exception and expose it to another SDR++ instance over the network.
 
 ```sh
 sudo apt update
@@ -260,7 +260,7 @@ sudo make install
 sudo ldconfig
 ```
 
-This trims the build down for a remote-radio deployment where the Matchstiq acts as the Sidekiq frontend and another machine runs the full SDR++ GUI. If you want to push wider sample rates across the network, a faster link such as a 2.5GbE USB 3 adapter can help.
+This trims the build down for an edge deployment and removes modules that are not needed for this minimal Sidekiq-focused setup. If you do choose to expose the device remotely to another SDR++ GUI, a faster link such as a 2.5GbE USB 3 adapter can help at higher sample rates.
 
 ### Running it
 
@@ -270,7 +270,7 @@ The headless streaming mode is provided by SDR++ core server mode. Run the insta
 sdrpp --server --addr 0.0.0.0 --port 5259
 ```
 
-On the GUI machine, select `SDR++ Server` as the source, connect to the Matchstiq host and port, and then control the remote `Sidekiq` source from there.
+If you do choose to use it remotely, select `SDR++ Server` on the GUI machine, connect to the Matchstiq host and port, and then control the remote `Sidekiq` source from there.
 
 ## Create a new root directory
 
