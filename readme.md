@@ -201,13 +201,13 @@ cmake ..
 make -j<N>
 ```
 
-## Sidekiq headless build example (Epiq Matchstik G40)
+## Sidekiq headless build example (Epiq Matchstiq G40)
 
 This branch includes a `sidekiq_source` module for Epiq Sidekiq hardware. In addition to the normal SDR++ dependencies, you will need the Sidekiq SDK installed. The Sidekiq build logic looks for the SDK in `$HOME/sidekiq_sdk_current` by default, or you can point it at a different location with `-DSidekiq_ROOT=/path/to/sdk` or `Sidekiq_DIR=/path/to/sdk`.
 
-Tested so far on this branch: Matchstik G20, Matchstik X40, and x86_64 host builds using `libsidekiq` 4.23.
+Tested so far on this branch: Matchstiq G20, Matchstiq X40, and x86_64 host builds using `libsidekiq` 4.23.
 
-For a Matchstik G40 system that is mainly meant to run headless and stream IQ over the network to another SDR++ GUI instance, the following package set has been tested:
+For a Matchstiq G40 system that is mainly meant to run headless and stream IQ over the network to another SDR++ GUI instance, the following package set has been tested:
 
 ```sh
 sudo apt update
@@ -260,7 +260,7 @@ sudo make install
 sudo ldconfig
 ```
 
-This trims the build down for a remote-radio deployment where the Matchstik acts as the Sidekiq frontend and another machine runs the full SDR++ GUI. If you want to push wider sample rates across the network, a faster link such as a 2.5GbE USB 3 adapter can help.
+This trims the build down for a remote-radio deployment where the Matchstiq acts as the Sidekiq frontend and another machine runs the full SDR++ GUI. If you want to push wider sample rates across the network, a faster link such as a 2.5GbE USB 3 adapter can help.
 
 ### Running it
 
@@ -270,7 +270,7 @@ The headless streaming mode is provided by SDR++ core server mode. Run the insta
 sdrpp --server --addr 0.0.0.0 --port 5259
 ```
 
-On the GUI machine, select `SDR++ Server` as the source, connect to the Matchstik host and port, and then control the remote `Sidekiq` source from there.
+On the GUI machine, select `SDR++ Server` as the source, connect to the Matchstiq host and port, and then control the remote `Sidekiq` source from there.
 
 ## Create a new root directory
 
