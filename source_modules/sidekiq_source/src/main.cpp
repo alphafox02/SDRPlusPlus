@@ -515,6 +515,7 @@ private:
         if (s->nvProfilesEnabled) {
             SmGui::LeftLabel("Use presets (NV100/NVM2)");
             SmGui::FillWidth();
+            SmGui::ForceSync();
             bool checkbox = s->useProfiles;
             if (SmGui::Checkbox(CONCAT_STR("##_sidekiq_useprof_", s->name), &checkbox)) {
                 s->useProfiles = checkbox;
