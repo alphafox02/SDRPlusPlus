@@ -422,8 +422,6 @@ private:
         };
 
         auto drawNvPresets = [&](){
-            const bool serverUi = core::args["server"].b();
-
             // EXACT rate list you provided; Quick presets = 80% BW
             static const uint32_t nvRatesHz[] = {
                 250000, 541667, 740740, 750000, 1000000, 1920000, 2457600, 2500000, 2800000,
@@ -458,80 +456,59 @@ private:
                 s->saveNvPresetConfig();
             }
 
-            // Advanced (default 80%)
-            bool showAdvanced = serverUi;
-            if (!serverUi) {
-                SmGui::LeftLabel("Advanced");
-                SmGui::FillWidth();
-                showAdvanced = ImGui::TreeNode(CONCAT_STR("##_sidekiq_nv_adv_", s->name));
+            std::string rateItems;
+            int ri = 0, rsel = 0;
+            for (auto hz : nvRatesHz) {
+                double msps = hz / 1e6;
+                char tmp[32]; std::snprintf(tmp, sizeof(tmp), "%.6g Msps", msps);
+                rateItems += tmp; rateItems.push_back('\0');
+                if ((int)hz == (int)s->nvSelectedRateHz) rsel = ri;
+                ++ri;
+            }
+            rateItems.push_back('\0');
+            SmGui::LeftLabel("Sample rate");
+            SmGui::FillWidth();
+            if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_sr_", s->name), &rsel, rateItems.c_str())) {
+                s->nvSelectedRateHz = nvRatesHz[rsel];
+                uint32_t bw_min = (uint32_t)(s->nvSelectedRateHz * 0.05);
+                uint32_t bw_max = (uint32_t)(s->nvSelectedRateHz * 0.95);
+                if (s->nvBwPresetHz < bw_min || s->nvBwPresetHz > bw_max) {
+                    s->nvBwPresetHz = (uint32_t)(s->nvSelectedRateHz * 0.80);
+                }
+                s->saveNvPresetConfig();
             }
 
-            if (showAdvanced) {
-                if (serverUi) {
-                    SmGui::Text("Advanced preset controls");
-                }
-
-                std::string rateItems;
-                int ri = 0, rsel = 0;
-                for (auto hz : nvRatesHz) {
-                    double msps = hz / 1e6;
-                    char tmp[32]; std::snprintf(tmp, sizeof(tmp), "%.6g Msps", msps);
-                    rateItems += tmp; rateItems.push_back('\0');
-                    if ((int)hz == (int)s->nvSelectedRateHz) rsel = ri;
-                    ++ri;
-                }
-                rateItems.push_back('\0');
-                SmGui::LeftLabel("Sample rate");
-                SmGui::FillWidth();
-                if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_sr_", s->name), &rsel, rateItems.c_str())) {
-                    s->nvSelectedRateHz = nvRatesHz[rsel];
-                    uint32_t bw_min = (uint32_t)(s->nvSelectedRateHz * 0.05);
-                    uint32_t bw_max = (uint32_t)(s->nvSelectedRateHz * 0.95);
-                    if (s->nvBwPresetHz < bw_min || s->nvBwPresetHz > bw_max) {
-                        s->nvBwPresetHz = (uint32_t)(s->nvSelectedRateHz * 0.80);
-                    }
-                    s->saveNvPresetConfig();
-                }
-
-                static const int bwPercents[] = { 5, 10, 20, 40, 50, 60, 80, 86, 89, 95 };
-                auto pctToIdx = [&](int pct){
-                    for (int i=0;i<10;i++) if (bwPercents[i]==pct) return i;
-                    return 6; // 80%
-                };
-                int bsel = pctToIdx(80);
-                for (int i=0;i<10;i++){
-                    uint32_t test = (uint32_t)((double)s->nvSelectedRateHz * (bwPercents[i] / 100.0));
-                    if (std::abs((int)test - (int)s->nvBwPresetHz) <= (int)std::max(1000u, s->nvSelectedRateHz/1000u)) {
-                        bsel = i; break;
-                    }
-                }
-
-                std::string bwItems;
-                for (auto pct : bwPercents) {
-                    uint32_t hz = (uint32_t)((double)s->nvSelectedRateHz * (pct/100.0));
-                    char tmp[48];
-                    if (hz >= 1000000)
-                        std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u MHz)", pct, (unsigned)(hz/1000000));
-                    else
-                        std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u kHz)", pct, (unsigned)(hz/1000));
-                    bwItems += tmp; bwItems.push_back('\0');
-                }
-                bwItems.push_back('\0');
-                SmGui::LeftLabel("Bandwidth");
-                SmGui::FillWidth();
-                if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_bw_", s->name), &bsel, bwItems.c_str())) {
-                    int pct = bwPercents[bsel];
-                    // keeps your original double math here (was not the overflow source)
-                    s->nvBwPresetHz = (uint32_t)((double)s->nvSelectedRateHz * (pct/100.0));
-                    s->saveNvPresetConfig();
-                }
-                if (!serverUi) {
-                    ImGui::TreePop();
+            static const int bwPercents[] = { 5, 10, 20, 40, 50, 60, 80, 86, 89, 95 };
+            auto pctToIdx = [&](int pct){
+                for (int i=0;i<10;i++) if (bwPercents[i]==pct) return i;
+                return 6; // 80%
+            };
+            int bsel = pctToIdx(80);
+            for (int i=0;i<10;i++){
+                uint32_t test = (uint32_t)((double)s->nvSelectedRateHz * (bwPercents[i] / 100.0));
+                if (std::abs((int)test - (int)s->nvBwPresetHz) <= (int)std::max(1000u, s->nvSelectedRateHz/1000u)) {
+                    bsel = i; break;
                 }
             }
 
-            if (!serverUi) {
-                ImGui::Separator();
+            std::string bwItems;
+            for (auto pct : bwPercents) {
+                uint32_t hz = (uint32_t)((double)s->nvSelectedRateHz * (pct/100.0));
+                char tmp[48];
+                if (hz >= 1000000)
+                    std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u MHz)", pct, (unsigned)(hz/1000000));
+                else
+                    std::snprintf(tmp, sizeof(tmp), "%d%%  (~%u kHz)", pct, (unsigned)(hz/1000));
+                bwItems += tmp; bwItems.push_back('\0');
+            }
+            bwItems.push_back('\0');
+            SmGui::LeftLabel("Bandwidth");
+            SmGui::FillWidth();
+            if (SmGui::Combo(CONCAT_STR("##_sidekiq_nv_bw_", s->name), &bsel, bwItems.c_str())) {
+                int pct = bwPercents[bsel];
+                // keeps your original double math here (was not the overflow source)
+                s->nvBwPresetHz = (uint32_t)((double)s->nvSelectedRateHz * (pct/100.0));
+                s->saveNvPresetConfig();
             }
         };
 
