@@ -422,6 +422,8 @@ private:
         };
 
         auto drawNvPresets = [&](){
+            const bool serverUi = core::args["server"].b();
+
             // EXACT rate list you provided; Quick presets = 80% BW
             static const uint32_t nvRatesHz[] = {
                 250000, 541667, 740740, 750000, 1000000, 1920000, 2457600, 2500000, 2800000,
@@ -457,9 +459,18 @@ private:
             }
 
             // Advanced (default 80%)
-            SmGui::LeftLabel("Advanced");
-            SmGui::FillWidth();
-            if (ImGui::TreeNode(CONCAT_STR("##_sidekiq_nv_adv_", s->name))) {
+            bool showAdvanced = serverUi;
+            if (!serverUi) {
+                SmGui::LeftLabel("Advanced");
+                SmGui::FillWidth();
+                showAdvanced = ImGui::TreeNode(CONCAT_STR("##_sidekiq_nv_adv_", s->name));
+            }
+
+            if (showAdvanced) {
+                if (serverUi) {
+                    SmGui::Text("Advanced preset controls");
+                }
+
                 std::string rateItems;
                 int ri = 0, rsel = 0;
                 for (auto hz : nvRatesHz) {
@@ -514,9 +525,14 @@ private:
                     s->nvBwPresetHz = (uint32_t)((double)s->nvSelectedRateHz * (pct/100.0));
                     s->saveNvPresetConfig();
                 }
-                ImGui::TreePop();
+                if (!serverUi) {
+                    ImGui::TreePop();
+                }
             }
-            ImGui::Separator();
+
+            if (!serverUi) {
+                ImGui::Separator();
+            }
         };
 
         if (s->nvProfilesEnabled) {
