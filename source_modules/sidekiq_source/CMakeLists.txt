@@ -136,24 +136,87 @@ endif()
 
 # ---------------- glib2 / tirpc / libusb ------------------------
 if (PkgConfig_FOUND)
-  pkg_check_modules(GLIB2 REQUIRED glib-2.0)
-else()
-  message(FATAL_ERROR "pkg-config not available; needed for glib-2.0")
+  pkg_check_modules(GLIB2 QUIET glib-2.0)
+endif()
+if (NOT GLIB2_FOUND)
+  set(_GLIB2_LIB_HINTS
+    "${EPIQ_SUPP_LIB_DIR}"
+    /usr/lib/epiq
+    /usr/lib
+    /usr/lib64
+    /usr/local/lib
+    /usr/lib/aarch64-linux-gnu
+    /usr/lib/x86_64-linux-gnu)
+  set(_GLIB2_INC_HINTS
+    "${Sidekiq_ROOT}/lib/support/${_support_sfx}/usr/include"
+    "${Sidekiq_ROOT}/lib/support/${_support_sfx}/usr/lib"
+    "${Sidekiq_ROOT}/lib/support/${_support_sfx}/usr/lib64"
+    /usr/include
+    /usr/local/include
+    /usr/lib/aarch64-linux-gnu
+    /usr/lib/x86_64-linux-gnu
+    /usr/lib64)
+
+  find_library(GLIB2_LIBRARY
+    NAMES glib-2.0 libglib-2.0.so libglib-2.0.so.0
+    HINTS ${_GLIB2_LIB_HINTS})
+  find_path(GLIB2_INCLUDE_DIR
+    NAMES glib.h
+    HINTS ${_GLIB2_INC_HINTS}
+    PATH_SUFFIXES glib-2.0)
+  find_path(GLIB2_CONFIG_INCLUDE_DIR
+    NAMES glibconfig.h
+    HINTS ${_GLIB2_INC_HINTS}
+    PATH_SUFFIXES glib-2.0/include)
+
+  if (GLIB2_LIBRARY)
+    set(GLIB2_FOUND TRUE)
+    set(GLIB2_LIBRARIES ${GLIB2_LIBRARY})
+    get_filename_component(_glib2_libdir "${GLIB2_LIBRARY}" DIRECTORY)
+    set(GLIB2_LIBRARY_DIRS "${_glib2_libdir}")
+    set(GLIB2_INCLUDE_DIRS "")
+    if (GLIB2_INCLUDE_DIR)
+      list(APPEND GLIB2_INCLUDE_DIRS "${GLIB2_INCLUDE_DIR}")
+    endif()
+    if (GLIB2_CONFIG_INCLUDE_DIR)
+      list(APPEND GLIB2_INCLUDE_DIRS "${GLIB2_CONFIG_INCLUDE_DIR}")
+    endif()
+    if (GLIB2_INCLUDE_DIRS)
+      list(REMOVE_DUPLICATES GLIB2_INCLUDE_DIRS)
+      message(STATUS "Found glib-2.0 (manual): ${GLIB2_LIBRARY}")
+    else()
+      message(WARNING "glib-2.0 headers not found; proceeding with library only")
+    endif()
+  else()
+    message(FATAL_ERROR "glib-2.0 not found (no pkg-config and manual search failed)")
+  endif()
 endif()
 
 if (PkgConfig_FOUND)
   pkg_check_modules(TIRPC QUIET libtirpc)
 endif()
 if (NOT TIRPC_FOUND)
-  set(_TIRPC_LIB_HINTS /usr/lib/epiq /usr/lib /usr/lib64 /usr/local/lib)
+  set(_TIRPC_LIB_HINTS
+    "${EPIQ_SUPP_LIB_DIR}"
+    /usr/lib/epiq
+    /usr/lib
+    /usr/lib64
+    /usr/local/lib
+    /usr/lib/aarch64-linux-gnu
+    /usr/lib/x86_64-linux-gnu)
   set(_TIRPC_INC_HINTS /usr/include/tirpc /usr/local/include/tirpc /usr/include)
   find_library(TIRPC_LIBRARY NAMES tirpc HINTS ${_TIRPC_LIB_HINTS})
   find_path(TIRPC_INCLUDE_DIR NAMES rpc/rpc.h HINTS ${_TIRPC_INC_HINTS})
-  if (TIRPC_LIBRARY AND TIRPC_INCLUDE_DIR)
+  if (TIRPC_LIBRARY)
     set(TIRPC_FOUND TRUE)
     set(TIRPC_LIBRARIES ${TIRPC_LIBRARY})
-    set(TIRPC_INCLUDE_DIRS ${TIRPC_INCLUDE_DIR})
-    message(STATUS "Found libtirpc (manual): ${TIRPC_LIBRARY}")
+    if (TIRPC_INCLUDE_DIR)
+      set(TIRPC_INCLUDE_DIRS ${TIRPC_INCLUDE_DIR})
+      message(STATUS "Found libtirpc (manual): ${TIRPC_LIBRARY}")
+    else()
+      set(TIRPC_INCLUDE_DIRS "")
+      message(WARNING "libtirpc headers not found; proceeding with library only")
+    endif()
   else()
     message(FATAL_ERROR "libtirpc not found (no pkg-config and manual search failed)")
   endif()
@@ -163,7 +226,14 @@ if (PkgConfig_FOUND)
   pkg_check_modules(LIBUSB QUIET libusb-1.0)
 endif()
 if (NOT LIBUSB_FOUND)
-  set(_USB_LIB_HINTS /usr/lib/epiq /usr/lib /usr/lib64 /usr/local/lib)
+  set(_USB_LIB_HINTS
+    "${EPIQ_SUPP_LIB_DIR}"
+    /usr/lib/epiq
+    /usr/lib
+    /usr/lib64
+    /usr/local/lib
+    /usr/lib/aarch64-linux-gnu
+    /usr/lib/x86_64-linux-gnu)
   set(_USB_INC_HINTS /usr/include/libusb-1.0 /usr/local/include/libusb-1.0 /usr/include)
   find_library(LIBUSB_LIBRARY NAMES usb-1.0 libusb-1.0.so libusb-1.0.so.0 HINTS ${_USB_LIB_HINTS})
   find_path(LIBUSB_INCLUDE_DIR NAMES libusb.h HINTS ${_USB_INC_HINTS})
